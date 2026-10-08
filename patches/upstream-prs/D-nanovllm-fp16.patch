@@ -1,0 +1,359 @@
+From 5901f060addb180601c3414fc8fca8b79ced9d8b Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 12:14:22 -0500
+Subject: [PATCH] fix(nano-vllm): keep the 5 Hz LM inside float16 range on GPUs
+ without bfloat16
+
+nano-vllm switches to float16 on pre-Ampere GPUs, and the 5 Hz LM (Qwen3 1.7B) then produces NaN
+logits: every token is id 0, so the planner returns '!!!!' and no song plan or audio codes. In
+float32 the residual stream reaches ~2,000,000 from decoder layer 2 on (one "massive activation" at
+<|im_start|>, channel 1793); the SwiGLU product feeding that layer's down_proj is ~85,000 and layer
+27's MLP output ~68,000 -- all past float16's 65,504.
+
+Float16 only (bfloat16 output is bit-identical to before; float32 unchanged):
+- RMSNorm.add_rms_forward keeps the residual stream in float32 (it already added in float32);
+- every MLP's up projection is divided by 128 (a power of two) and its output multiplied back in
+  float32: numerically equivalent, and the worst MLP output is 16,264 in float16 (~4x headroom).
+The decision lives in fp16_range.maybe_apply_fp16_range(model, dtype), called after load_model.
+
+On a Tesla V100: the planner writes real plans again; greedy output matches the float32 model
+token for token on 4 of 5 prompts (64 tokens); the full thinking pipeline makes songs with real
+audio codes, the LM step taking 24 s for a 3:10 song (on the pt backend, the only working one
+before, it took 110-126 s). nano-vllm 0.2.0 -> 0.2.1 (pyproject + uv.lock) so uv rebuilds the
+bundled copy. Tests: python -m unittest nanovllm.layers.fp16_range_test (from the nano-vllm dir).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../nano-vllm/nanovllm/engine/model_runner.py |   2 +
+ .../nano-vllm/nanovllm/layers/fp16_range.py   |  61 +++++++
+ .../nanovllm/layers/fp16_range_test.py        | 163 ++++++++++++++++++
+ .../nano-vllm/nanovllm/layers/layernorm.py    |   5 +-
+ .../nano-vllm/nanovllm/models/qwen3.py        |   3 +
+ acestep/third_parts/nano-vllm/pyproject.toml  |   2 +-
+ uv.lock                                       |   2 +-
+ 7 files changed, 234 insertions(+), 4 deletions(-)
+ create mode 100644 acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range.py
+ create mode 100644 acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range_test.py
+
+diff --git a/acestep/third_parts/nano-vllm/nanovllm/engine/model_runner.py b/acestep/third_parts/nano-vllm/nanovllm/engine/model_runner.py
+index 25e468a..555ed55 100644
+--- a/acestep/third_parts/nano-vllm/nanovllm/engine/model_runner.py
++++ b/acestep/third_parts/nano-vllm/nanovllm/engine/model_runner.py
+@@ -19,6 +19,7 @@ def _debug_log(msg: str):
+         print(f"[nanovllm DEBUG] {msg}", flush=True)
+ from nanovllm.engine.sequence import Sequence
+ from nanovllm.models.qwen3 import Qwen3ForCausalLM
++from nanovllm.layers.fp16_range import maybe_apply_fp16_range
+ from nanovllm.layers.sampler import Sampler
+ from nanovllm.utils.context import set_context, get_context, reset_context
+ from nanovllm.utils.loader import load_model
+@@ -173,6 +174,7 @@ class ModelRunner:
+         self.model = Qwen3ForCausalLM(hf_config)
+         _t0 = debug_start("load_model", prefix="tensor.vllm")
+         load_model(self.model, config.model)
++        maybe_apply_fp16_range(self.model, self.dtype)   # float16 only
+         debug_end("load_model", _t0, prefix="tensor.vllm")
+         self.sampler = Sampler()
+         
+diff --git a/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range.py b/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range.py
+new file mode 100644
+index 0000000..9f07f7d
+--- /dev/null
++++ b/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range.py
+@@ -0,0 +1,61 @@
++"""Keep the Qwen3 LM inside float16's range when it runs in float16 (GPUs without bfloat16).
++
++ACE-Step's 5 Hz LM (Qwen3, 1.7B) has one "massive activation": decoder layer 2's MLP writes
++~2,000,000 into channel 1793 at the ``<|im_start|>`` token (an attention sink), and the SwiGLU
++product feeding its ``down_proj`` is already ~85,000 -- both past float16's 65,504 (layer 27's
++MLP output, ~68,000, is past it too). In float16 the logits turn NaN and every sampled token is
++id 0 ('!').
++
++Two changes, float16 only, numerically equivalent to the original model:
++- each MLP's "up" weights are divided by ``MLP_SCALE`` and its output multiplied back by it in
++  float32 (a power of two), keeping the product and ``down_proj`` in range;
++- the residual stream is carried in float32 (RMSNorm.add_rms_forward), so the 2-million value
++  never touches float16.
++"""
++
++import math
++
++import torch
++from torch import nn
++
++# 2.08M / 128 = 16,264 for the 5 Hz LM's worst MLP: ~4x headroom (32 is the smallest that fits).
++MLP_SCALE = 128.0
++
++
++def apply_fp16_mlp_scale(model: nn.Module, factor: float = MLP_SCALE) -> int:
++    """Divide every Qwen3 MLP's up projection by ``factor`` and make the MLP undo it in float32.
++
++    Args:
++        model: The loaded nano-vllm model (``Qwen3ForCausalLM``).
++        factor: A power of two, so dividing and multiplying back loses nothing.
++
++    Returns:
++        How many MLPs were changed (0 if already applied).
++
++    Raises:
++        ValueError: If ``factor`` is not a positive power of two.
++    """
++    if factor <= 0 or math.frexp(factor)[0] != 0.5:
++        raise ValueError(f"factor must be a positive power of two, got {factor}")
++    changed = 0
++    for module in model.modules():
++        gate_up = getattr(module, "gate_up_proj", None)
++        if gate_up is None or not hasattr(module, "out_scale") or module.out_scale != 1.0:
++            continue
++        with torch.no_grad():
++            weight = gate_up.weight            # [gate; up] -- also per tensor-parallel shard
++            weight[weight.shape[0] // 2:].div_(factor)
++        module.out_scale = factor
++        changed += 1
++    return changed
++
++
++def maybe_apply_fp16_range(model: nn.Module, dtype: torch.dtype) -> int:
++    """Apply the MLP scale to a freshly loaded model if (and only if) it runs in float16.
++
++    Returns:
++        How many MLPs were changed (0 for bfloat16 / float32 models).
++    """
++    if dtype != torch.float16:
++        return 0
++    return apply_fp16_mlp_scale(model)
+diff --git a/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range_test.py b/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range_test.py
+new file mode 100644
+index 0000000..5d8dd86
+--- /dev/null
++++ b/acestep/third_parts/nano-vllm/nanovllm/layers/fp16_range_test.py
+@@ -0,0 +1,163 @@
++"""Tests for keeping nano-vllm's Qwen3 LM inside float16's range.
++
++Covers fp16_range.py and RMSNorm.add_rms_forward. ACE-Step's 5 Hz LM writes ~2,000,000 into its
++residual stream at decoder layer 2 (the SwiGLU product feeding that layer's down_proj is ~85,000);
++in float16 every sampled token became '!'. These tests use nano-vllm's real Qwen3MLP and RMSNorm
++with tiny sizes, scaled up to overflow float16 the same way.
++
++Run from acestep/third_parts/nano-vllm: python -m unittest nanovllm.layers.fp16_range_test
++(nanovllm's subpackages have no __init__.py, so unittest discovery does not find these tests).
++"""
++
++import inspect
++import unittest
++
++import torch
++from torch import nn
++
++from nanovllm.engine import model_runner
++from nanovllm.layers import fp16_range as FIX
++from nanovllm.layers.layernorm import RMSNorm
++from nanovllm.models.qwen3 import Qwen3MLP
++
++FLOAT16_MAX = 65504.0
++
++
++def _mlp(dtype: torch.dtype = torch.float32, boost: float = 1.0) -> Qwen3MLP:
++    """A tiny real Qwen3MLP; ``boost`` makes its product and output overflow float16.
++
++    The weights are drawn in float32 and then converted, so every dtype holds the same model.
++    """
++    torch.manual_seed(0)
++    mlp = Qwen3MLP(hidden_size=16, intermediate_size=32, hidden_act="silu").float()
++    with torch.no_grad():
++        for p in mlp.parameters():
++            p.normal_(0.0, 0.5)
++        mlp.gate_up_proj.weight.mul_(boost)
++    return mlp.to(dtype)
++
++
++class MlpScaleTests(unittest.TestCase):
++    """apply_fp16_mlp_scale on nano-vllm's Qwen3MLP."""
++
++    def setUp(self):
++        """A fixed input."""
++        torch.manual_seed(1)
++        self.x = torch.randn(3, 16)
++
++    def test_output_is_unchanged(self):
++        """Dividing 'up' by a power of two and multiplying back gives the same output."""
++        mlp = _mlp()
++        before = mlp(self.x)
++        self.assertEqual(FIX.apply_fp16_mlp_scale(mlp), 1)
++        after = mlp(self.x)
++        self.assertEqual(after.dtype, torch.float32)
++        self.assertTrue(torch.allclose(before, after, rtol=1e-6, atol=1e-6))
++
++    def test_only_the_up_half_is_scaled(self):
++        """gate_up_proj holds [gate; up]: gate stays, up is divided."""
++        mlp = _mlp()
++        w = mlp.gate_up_proj.weight.detach().clone()
++        FIX.apply_fp16_mlp_scale(mlp, factor=128.0)
++        half = w.shape[0] // 2
++        self.assertTrue(torch.equal(mlp.gate_up_proj.weight[:half], w[:half]))
++        self.assertTrue(torch.equal(mlp.gate_up_proj.weight[half:], w[half:] / 128.0))
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: an MLP past 65,504 gives inf in float16, the right answer when fixed."""
++        reference = _mlp(torch.float32, boost=60.0)(self.x)
++        self.assertGreater(reference.abs().max().item(), FLOAT16_MAX)
++        mlp = _mlp(torch.float16, boost=60.0)
++        self.assertFalse(torch.isfinite(mlp(self.x.half()).float()).all())
++        FIX.apply_fp16_mlp_scale(mlp)
++        out = mlp(self.x.half())
++        self.assertEqual(out.dtype, torch.float32)        # handed to the float32 residual stream
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertLess(((out - reference).norm() / reference.norm()).item(), 1e-2)
++
++    def test_the_real_models_worst_mlp_fits(self):
++        """Pinned to the 5 Hz LM's layer 2: ~85,000 into down_proj, ~2.1 million out (float32)."""
++        mlp = Qwen3MLP(hidden_size=16, intermediate_size=32, hidden_act="silu").float()
++        with torch.no_grad():
++            half = mlp.gate_up_proj.weight.shape[0] // 2
++            mlp.gate_up_proj.weight[:half].fill_(300.0 / 16)     # gate = 300 on all-ones input
++            mlp.gate_up_proj.weight[half:].fill_(285.0 / 16)     # up = 285: product ~85,500
++            mlp.down_proj.weight.fill_(0.77)                     # 32 x 85,500 x 0.77 = 2.1M
++        x = torch.ones(1, 16)
++        reference = mlp(x)
++        self.assertGreater(reference.abs().max().item(), 2.0e6)
++        fp16 = mlp.half()
++        self.assertFalse(torch.isfinite(fp16(x.half()).float()).all())
++        FIX.apply_fp16_mlp_scale(fp16)
++        out = fp16(x.half())
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertLess(((out - reference).abs().max() / reference.abs().max()).item(), 1e-2)
++
++    def test_factor_must_be_a_power_of_two(self):
++        """Only a power of two divides and multiplies back without changing any value."""
++        with self.assertRaises(ValueError):
++            FIX.apply_fp16_mlp_scale(_mlp(), factor=1.5)
++
++    def test_float16_models_get_it_and_others_do_not(self):
++        """maybe_apply_fp16_range: float16 changes every MLP; bfloat16 and float32 change none."""
++        both = nn.ModuleList([_mlp(), _mlp()])
++        self.assertEqual(FIX.maybe_apply_fp16_range(both, torch.float16), 2)
++        for dtype in (torch.bfloat16, torch.float32):
++            mlp = _mlp()
++            w = mlp.gate_up_proj.weight.detach().clone()
++            self.assertEqual(FIX.maybe_apply_fp16_range(mlp, dtype), 0)
++            self.assertTrue(torch.equal(w, mlp.gate_up_proj.weight))
++
++    def test_the_model_runner_applies_it_after_loading(self):
++        """ModelRunner calls it with the model and its dtype right after load_model."""
++        source = inspect.getsource(model_runner.ModelRunner.__init__)
++        load = source.index("load_model(self.model, config.model)")
++        call = source.index("maybe_apply_fp16_range(self.model, self.dtype)")
++        self.assertLess(load, call)
++        self.assertLess(call, source.index("self.warmup_model()"))
++
++    def test_applying_twice_scales_once(self):
++        """A second call changes nothing."""
++        mlp = _mlp()
++        FIX.apply_fp16_mlp_scale(mlp)
++        w = mlp.gate_up_proj.weight.detach().clone()
++        self.assertEqual(FIX.apply_fp16_mlp_scale(mlp), 0)
++        self.assertTrue(torch.equal(w, mlp.gate_up_proj.weight))
++
++    def test_counts_every_mlp_and_skips_other_modules(self):
++        """Every Qwen3MLP in a model is changed; other modules are left alone."""
++        other = nn.Linear(4, 4)
++        w = other.weight.detach().clone()
++        model = nn.ModuleList([_mlp(), _mlp(), other])
++        self.assertEqual(FIX.apply_fp16_mlp_scale(model), 2)
++        self.assertTrue(torch.equal(w, other.weight))
++
++    def test_unscaled_mlp_keeps_its_dtype(self):
++        """Without the fix (bfloat16 / float32 models) the MLP output keeps the model dtype."""
++        self.assertEqual(_mlp(torch.bfloat16)(self.x.bfloat16()).dtype, torch.bfloat16)
++
++
++class ResidualStreamTests(unittest.TestCase):
++    """RMSNorm.add_rms_forward carries the residual in float32 for float16 models only."""
++
++    def test_float16_model_keeps_a_float32_residual(self):
++        """A residual past 65,504 survives exactly; the normalised output is float16."""
++        norm = RMSNorm(8).half()
++        x = torch.full((2, 8), 3.0, dtype=torch.float32)                 # e.g. a scaled MLP output
++        residual = torch.full((2, 8), 2_000_000.0, dtype=torch.float32)
++        out, new_residual = norm(x, residual)
++        self.assertEqual(new_residual.dtype, torch.float32)
++        self.assertTrue(torch.equal(new_residual, torch.full((2, 8), 2_000_003.0)))
++        self.assertEqual(out.dtype, torch.float16)
++        self.assertTrue(torch.isfinite(out).all())
++
++    def test_bfloat16_model_is_unchanged(self):
++        """bfloat16 models keep a bfloat16 residual, as before."""
++        norm = RMSNorm(8).bfloat16()
++        x = torch.randn(2, 8).bfloat16()
++        out, residual = norm(x, torch.randn(2, 8).bfloat16())
++        self.assertEqual((out.dtype, residual.dtype), (torch.bfloat16, torch.bfloat16))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/third_parts/nano-vllm/nanovllm/layers/layernorm.py b/acestep/third_parts/nano-vllm/nanovllm/layers/layernorm.py
+index 79ec1be..92abc8f 100755
+--- a/acestep/third_parts/nano-vllm/nanovllm/layers/layernorm.py
++++ b/acestep/third_parts/nano-vllm/nanovllm/layers/layernorm.py
+@@ -33,9 +33,10 @@ class RMSNorm(nn.Module):
+         x: torch.Tensor,
+         residual: torch.Tensor,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        orig_dtype = x.dtype
++        orig_dtype = self.weight.dtype
+         x = x.float().add_(residual.float())
+-        residual = x.to(orig_dtype)
++        # float16 models carry the residual in float32: it can exceed float16 (see fp16_range.py)
++        residual = x.clone() if orig_dtype == torch.float16 else x.to(orig_dtype)
+         var = x.pow(2).mean(dim=-1, keepdim=True)
+         x.mul_(torch.rsqrt(var + self.eps))
+         x = x.to(orig_dtype).mul_(self.weight)
+diff --git a/acestep/third_parts/nano-vllm/nanovllm/models/qwen3.py b/acestep/third_parts/nano-vllm/nanovllm/models/qwen3.py
+index 4db4d26..63b1f84 100755
+--- a/acestep/third_parts/nano-vllm/nanovllm/models/qwen3.py
++++ b/acestep/third_parts/nano-vllm/nanovllm/models/qwen3.py
+@@ -109,11 +109,14 @@ class Qwen3MLP(nn.Module):
+         )
+         assert hidden_act == "silu"
+         self.act_fn = SiluAndMul()
++        self.out_scale = 1.0          # set by layers/fp16_range.py for float16 models
+ 
+     def forward(self, x):
+         gate_up = self.gate_up_proj(x)
+         x = self.act_fn(gate_up)
+         x = self.down_proj(x)
++        if self.out_scale != 1.0:
++            x = x.float() * self.out_scale
+         return x
+ 
+ 
+diff --git a/acestep/third_parts/nano-vllm/pyproject.toml b/acestep/third_parts/nano-vllm/pyproject.toml
+index 3965002..ca07c84 100644
+--- a/acestep/third_parts/nano-vllm/pyproject.toml
++++ b/acestep/third_parts/nano-vllm/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "nano-vllm"
+-version = "0.2.0"
++version = "0.2.1"
+ authors = [{ name = "Xingkai Yu" }]
+ license = {text = "MIT"}
+ readme = "README.md"
+diff --git a/uv.lock b/uv.lock
+index 87c2442..58d1ffe 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1269,7 +1269,7 @@ wheels = [
+ 
+ [[package]]
+ name = "nano-vllm"
+-version = "0.2.0"
++version = "0.2.1"
+ source = { directory = "acestep/third_parts/nano-vllm" }
+ dependencies = [
+     { name = "flash-attn", version = "2.8.2", source = { url = "https://github.com/sdbds/flash-attention-for-windows/releases/download/2.8.2/flash_attn-2.8.2+cu128torch2.7.1cxx11abiFALSEfullbackward-cp311-cp311-win_amd64.whl" }, marker = "python_full_version < '3.12' and platform_machine == 'AMD64' and sys_platform == 'win32'" },
+-- 
+2.43.0
+
