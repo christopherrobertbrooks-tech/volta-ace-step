@@ -45,6 +45,31 @@ the official way (`uv sync`: torch 2.10.0+cu128 -- which still includes sm_70).
 - Similarity (same seed): waveforms of generated music don't line up across precisions (4070 vs V100 FP32 correlate
   at -0.04 too), so the check is by ear plus spectrum similarity: FP16-fix vs FP32 0.85, 4070 vs FP32 0.90.
 
+## Test 1: eight full-length songs (2026-10-07)
+
+ACE-Step's own `examples/text2music/example_NN.json` (caption, lyrics, BPM, key, length as shipped), V100, FP16 with
+fix 2, seed 1234, a hook on every layer. Max |value| per part; FP16's limit is 65,504.
+
+| # | language | length | lyrics chars | result | lyric encoder max | decoder max (layer) | time* |
+| ---: | :--- | ---: | ---: | :--- | ---: | ---: | ---: |
+| 01 | zh | 160 s | 460 | song, 0 NaN | 501,389 | 26,016 (layers.23) | 15.9 s |
+| 02 | es | 159 s | 1450 | song, 0 NaN | 449,292 | 23,952 (layers.14) | 16.1 s |
+| 03 | fr | 142 s | 2729 | song, 0 NaN | 480,436 | 24,000 (layers.23) | 15.4 s |
+| 05 | ja | 200 s | 1549 | song, 0 NaN | 444,358 | 26,560 (layers.20) | 20.7 s |
+| 10 | en | 228 s | 1184 | song, 0 NaN | 504,648 | 25,408 (layers.23) | 23.5 s |
+| 113 | zh | 220 s | 243 | song, 0 NaN | 423,573 | 23,440 (layers.23) | 22.1 s |
+| 118 | zh | 178 s | 210 | song, 0 NaN | 415,467 | 28,064 (layers.23) | 17.9 s |
+| 108 | zh | 236 s | 133 | song, 0 NaN | 267,289 | 23,264 (layers.14) | 23.8 s |
+
+\*with all 1,466 hooks attached, which slows it down; not a speed figure.
+
+- **All eight make songs.** Without fix 2 every one would fail: the lyric encoder reaches 267,000-505,000 on all of
+  them -- even #108, an instrumental whose "lyrics" are only section tags.
+- **The decoder never comes near the limit:** 23,264-28,064 across languages, styles and lengths up to 3:56, the same
+  range as the 30-s song (29,738). Longer songs do not push it higher.
+- The VAE hooks recorded nothing (max 0) -- the decoder-to-audio step isn't covered by this probe yet; the audio
+  itself is fine (RMS 0.12-0.18, no NaN).
+
 ## Plan
 
 1. Install exactly the official way and record what a V100 owner runs into.
