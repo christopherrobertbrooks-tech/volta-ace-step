@@ -2,7 +2,7 @@ From 3a7236115952d18e1f88dbfc9d9aae50642d1c93 Mon Sep 17 00:00:00 2001
 From: christopherrobertbrooks-tech
  <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 21:14:11 -0500
-Subject: [PATCH 2/3] Keep the lyric encoder in float32 when the model runs in
+Subject: [PATCH 2/4] Keep the lyric encoder in float32 when the model runs in
  float16 (pre-Ampere NaN latents, #1055)
 
 ---

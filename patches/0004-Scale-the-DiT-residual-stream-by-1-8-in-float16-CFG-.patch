@@ -1,0 +1,180 @@
+From 42639f3bfb8d751a1373a89d44b85b05b71ace64 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 21:58:09 -0500
+Subject: [PATCH 4/4] Scale the DiT residual stream by 1/8 in float16 (CFG
+ models overflow at a gated decoder layer)
+
+---
+ .../handler/dit_stream_scale_test.py          | 106 ++++++++++++++++++
+ .../generation/handler/init_service_loader.py |  34 ++++++
+ 2 files changed, 140 insertions(+)
+ create mode 100644 acestep/core/generation/handler/dit_stream_scale_test.py
+
+diff --git a/acestep/core/generation/handler/dit_stream_scale_test.py b/acestep/core/generation/handler/dit_stream_scale_test.py
+new file mode 100644
+index 0000000..d870cfd
+--- /dev/null
++++ b/acestep/core/generation/handler/dit_stream_scale_test.py
+@@ -0,0 +1,106 @@
++"""Tests for rescaling the DiT residual stream when the model runs in float16 (pre-Ampere CUDA).
++
++With CFG models (sft/base, 50 steps) the gated MLP output of decoder.layers.20 reaches ~137,000 in float32 on a V100
++-- past float16's 65,504 -- and every latent turns NaN. Every branch reads the stream through a (scale-invariant)
++RMSNorm and the stream ends in norm_out, so dividing the stream's input and every branch output by a power of two
++leaves the result unchanged while keeping the stream inside float16's range."""
++
++import unittest
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import init_service_loader as LOADER
++
++
++class _RMSNorm(nn.Module):
++    def __init__(self, d, eps=1e-6):
++        super().__init__(); self.w = nn.Parameter(torch.ones(d)); self.eps = eps
++    def forward(self, x):
++        return self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
++
++
++class _Attn(nn.Module):
++    def __init__(self, d):
++        super().__init__(); self.v = nn.Linear(d, d); self.o_proj = nn.Linear(d, d)
++    def forward(self, x):
++        return self.o_proj(torch.tanh(self.v(x)))
++
++
++class _MLP(nn.Module):
++    def __init__(self, d):
++        super().__init__(); self.up = nn.Linear(d, 2 * d); self.down_proj = nn.Linear(2 * d, d)
++    def forward(self, x):
++        return self.down_proj(torch.relu(self.up(x)))
++
++
++class _Layer(nn.Module):
++    """Same residual pattern as AceStepDiTLayer: gated self-attn, ungated cross-attn, gated MLP, all read through norms."""
++    def __init__(self, d, gate):
++        super().__init__()
++        self.self_attn_norm, self.cross_attn_norm, self.mlp_norm = _RMSNorm(d), _RMSNorm(d), _RMSNorm(d)
++        self.self_attn, self.cross_attn, self.mlp = _Attn(d), _Attn(d), _MLP(d)
++        self.gate = gate
++    def forward(self, x):
++        x = x + self.self_attn(self.self_attn_norm(x)) * self.gate
++        x = x + self.cross_attn(self.cross_attn_norm(x))
++        return x + self.mlp(self.mlp_norm(x)) * self.gate
++
++
++class _Decoder(nn.Module):
++    def __init__(self, d=16, gate=40.0):
++        super().__init__()
++        self.proj_in = nn.Sequential(nn.Linear(8, d))
++        self.layers = nn.ModuleList([_Layer(d, gate) for _ in range(3)])
++        self.norm_out = _RMSNorm(d)
++        self.proj_out = nn.Linear(d, 8)
++        self.stream_max = 0.0
++    def forward(self, x):
++        h = self.proj_in(x)
++        for layer in self.layers:
++            h = layer(h); self.stream_max = max(self.stream_max, h.abs().max().item())
++        return self.proj_out(self.norm_out(h))
++
++
++class _Model(nn.Module):
++    def __init__(self, **kw):
++        super().__init__(); self.decoder = _Decoder(**kw)
++
++
++class RescaleDitResidualStreamTests(unittest.TestCase):
++    def setUp(self):
++        torch.manual_seed(0)
++        self.x = torch.randn(2, 5, 8) * 50
++
++    def test_output_is_unchanged_and_the_stream_is_smaller(self):
++        model = _Model()
++        before = model.decoder(self.x); peak_before = model.decoder.stream_max
++        self.assertTrue(LOADER._rescale_dit_residual_stream(model, factor=8.0))
++        model.decoder.stream_max = 0.0
++        after = model.decoder(self.x)
++        self.assertTrue(torch.allclose(before, after, rtol=1e-4, atol=1e-4))
++        self.assertAlmostEqual(model.decoder.stream_max, peak_before / 8.0, delta=peak_before * 1e-3)
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: the fake stream overflows float16 unscaled and stays finite once rescaled."""
++        model = _Model(gate=300000.0).half()
++        x = self.x.half()
++        self.assertFalse(torch.isfinite(model.decoder(x)).all())
++        LOADER._rescale_dit_residual_stream(model, factor=64.0)
++        self.assertTrue(torch.isfinite(model.decoder(x)).all())
++
++    def test_applying_twice_does_not_scale_twice(self):
++        model = _Model()
++        LOADER._rescale_dit_residual_stream(model, factor=8.0)
++        w = model.decoder.layers[0].mlp.down_proj.weight.clone()
++        LOADER._rescale_dit_residual_stream(model, factor=8.0)
++        self.assertTrue(torch.equal(w, model.decoder.layers[0].mlp.down_proj.weight))
++
++    def test_models_without_that_decoder_shape_are_left_alone(self):
++        self.assertFalse(LOADER._rescale_dit_residual_stream(nn.Linear(4, 4), factor=8.0))
++        m = _Model(); del m.decoder.norm_out          # no closing norm -> the trick would change the output
++        self.assertFalse(LOADER._rescale_dit_residual_stream(m, factor=8.0))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 99e574c..0d3540c 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -12,6 +12,38 @@ from .init_service_loader_components import InitServiceLoaderComponentsMixin
+ 
+ 
+ 
++def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
++    """Keep the DiT decoder's residual stream inside float16's range by scaling it down by ``factor``.
++
++    With the CFG models (sft/base) the gated MLP output of a decoder layer can exceed float16's 65,504 (|x| ~ 137,000
++    in decoder.layers.20 on a Tesla V100), turning every latent into NaN on pre-Ampere cards.  Every branch reads the
++    stream through an RMSNorm, which ignores its overall scale, and the stream ends in ``norm_out``; so dividing the
++    stream's input (``proj_in``) and every branch output (``o_proj`` of self/cross attention, the MLP's ``down_proj``)
++    by the same power of two leaves the generated audio unchanged, costs nothing at run time, and is exact in float16.
++    Returns True if the decoder has that shape and was rescaled (once).
++    """
++    decoder = getattr(model, "decoder", None)
++    layers = getattr(decoder, "layers", None)
++    proj_in = getattr(decoder, "proj_in", None)
++    if not isinstance(layers, torch.nn.ModuleList) or proj_in is None or getattr(decoder, "norm_out", None) is None:
++        return False
++    if getattr(decoder, "_acestep_stream_scale", None):
++        return True
++    targets = [m for m in proj_in.modules() if isinstance(m, (torch.nn.Linear, torch.nn.Conv1d))]
++    for layer in layers:
++        for branch in (getattr(getattr(layer, "self_attn", None), "o_proj", None),
++                       getattr(getattr(layer, "cross_attn", None), "o_proj", None),
++                       getattr(getattr(layer, "mlp", None), "down_proj", None)):
++            if isinstance(branch, torch.nn.Linear):
++                targets.append(branch)
++    with torch.no_grad():
++        for module in targets:
++            module.weight.div_(factor)
++            if module.bias is not None:
++                module.bias.div_(factor)
++    decoder._acestep_stream_scale = factor
++    return True
++
+ def _keep_lyric_encoder_in_float32(model) -> bool:
+     """Run the lyric encoder in float32 when the rest of the model runs in float16.
+ 
+@@ -238,6 +270,8 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+         self.model.eval()
+         if self.dtype == torch.float16 and _keep_lyric_encoder_in_float32(self.model):
+             logger.info("[initialize_service] float16 model: keeping the lyric encoder in float32 (it overflows float16).")
++        if self.dtype == torch.float16 and _rescale_dit_residual_stream(self.model):
++            logger.info("[initialize_service] float16 model: DiT residual stream scaled by 1/8 to stay in float16 range.")
+ 
+         if compile_model:
+             self._ensure_len_for_compile(self.model, "model")
+-- 
+2.43.0
+

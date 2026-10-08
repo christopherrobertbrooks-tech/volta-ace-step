@@ -2,7 +2,7 @@ From 3dcc6a36d9d4a68251129c6864f1b73bd030b043 Mon Sep 17 00:00:00 2001
 From: christopherrobertbrooks-tech
  <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
 Date: Wed, 7 Oct 2026 21:37:58 -0500
-Subject: [PATCH 3/3] Comment why the lyric-encoder wrapper only upcasts
+Subject: [PATCH 3/4] Comment why the lyric-encoder wrapper only upcasts
  inputs_embeds
 
 ---

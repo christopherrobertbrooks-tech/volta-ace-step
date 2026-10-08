@@ -81,7 +81,22 @@ Against `ace-step/ACE-Step-1.5` at `ca1e85f`; apply with `git am patches/*.patch
 3. `0003` -- a comment on why the wrapper only upcasts `inputs_embeds` (`AceStepLyricEncoder.forward` asserts
    `input_ids is None`; the integer attention mask passes through).
 
+4. `0004` -- scale the DiT decoder's residual stream by 1/8 in float16 (`_rescale_dit_residual_stream()`, 4 tests,
+   including one that checks the output is unchanged). Needed for the CFG models (sft/base): see below.
+
 Not yet proposed upstream: tests 2-5 below come first.
+
+### Second overflow: the CFG models (found in test 2)
+
+The `acestep-v15-sft` model (50 steps, CFG 7.0) still failed in FP16 with fix 2: 3 of 3 songs gave all-NaN latents,
+first non-finite output in `model.decoder.layers.20`. An FP32 probe (`scripts/probe2.py`) shows the decoder's layer-20
+output reaching **136,973** (2.1x FP16's limit) while every branch inside it stays under 16,000 -- the spike is the
+MLP output times its timestep gate (`ff_output * c_gate_msa`), and the stream comes back down in layers 21-23
+(24K, 19K). Turbo models (no CFG, 8 steps) peak at ~28K, which is why test 1 never hit it.
+
+Every branch reads the stream through an RMSNorm, which ignores scale, and the stream ends in `norm_out`; so fix 3
+divides `proj_in` and every `o_proj` / `down_proj` by 8 at load time: exact in FP16, zero run-time cost, same output.
+With it, sft makes all three failed songs (layer-20 peak 21-22K).
 
 ### Open question for the maintainers: loader-side wrapper or model-side dtype handling?
 
