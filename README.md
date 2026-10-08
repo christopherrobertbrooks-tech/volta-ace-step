@@ -9,8 +9,8 @@ description. On cards without BF16 hardware (Volta, Turing, Pascal) it falls bac
 suggests `ACESTEP_DTYPE=float32` -- a setting the code doesn't read. Reports:
 [#1055](https://github.com/ace-step/ACE-Step-1.5/issues/1055) (P40, GTX 1080, Titan Xp),
 [#1243](https://github.com/ace-step/ACE-Step-1.5/issues/1243) (T4),
-[#1274](https://github.com/ace-step/ACE-Step-1.5/issues/1274) (Pascal / Turing),
-[#927](https://github.com/ace-step/ACE-Step-1.5/issues/927) (T4) -- all closed as stale, none fixed.
+[#927](https://github.com/ace-step/ACE-Step-1.5/issues/927) (T4) -- all closed as stale, none fixed (see also the closed,
+unmerged PR [#1274](https://github.com/ace-step/ACE-Step-1.5/pull/1274), a float32 fallback).
 
 ## Result
 
@@ -133,6 +133,20 @@ Two of tonight's surprises were the instrument, not the model:
 - `data/` -- per-song results.
 - [ENVIRONMENT.md](ENVIRONMENT.md) -- the two machines.
 
-## Next
+## Upstream PRs (drafted, not posted)
 
-1. The upstream PR, following ACE-Step's CONTRIBUTING.md (AI-assisted rules).
+The fixes are prepared as **three independent PRs** against `main` (`ca1e85f`), following ACE-Step's CONTRIBUTING.md
+and AGENTS.md (one problem per PR, each fix in its own small module, the loader gets 3 lines, tests that fail without
+the change -- each test was also checked by deliberately breaking the code it covers):
+
+| PR | change | patch | description draft |
+| :--- | :--- | :--- | :--- |
+| A | lyric encoder: last projection in FP32 | `patches/upstream-prs/A-lyric-encoder.patch` | `pr-drafts/A-lyric-encoder.md` |
+| B | DiT residual stream / 64 via hooks | `patches/upstream-prs/B-dit-stream.patch` | `pr-drafts/B-dit-stream.md` |
+| C | attention score scale on the queries | `patches/upstream-prs/C-xl-attention.patch` | `pr-drafts/C-xl-attention.md` |
+
+Differences from `patches/0001-0007` (the working versions): no weights are modified any more -- B and C use forward
+hooks, so LoRA adapters on `o_proj` keep their normal strength (the weight-scaling version made them 64x too strong
+in float16) -- and the `ACESTEP_DTYPE` override (`0001`) is left to the existing PRs #1312 / #1185. Each PR's commit
+was reviewed by a separate agent (two passes for A) and the findings applied. Full `unittest discover` suite: `main`
+1,230 tests with 44 pre-existing failures; with all three PRs 1,270 tests, the same 44.

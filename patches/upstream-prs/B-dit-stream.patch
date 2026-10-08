@@ -1,0 +1,575 @@
+From 088f1f89965d8398932ca984f080262ff504458c Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:32:50 -0500
+Subject: [PATCH] fix(cuda): keep the DiT residual stream inside float16 range
+ (CFG and XL models)
+
+On GPUs without bfloat16 the model runs in float16. With CFG models the gated MLP product of a
+decoder layer reaches ~137,000 (2B sft, layers.20) and the XL decoder stream ~1.36 million
+(xl-sft, layers.18) -- past float16's 65,504 -- so every latent turns NaN.
+
+Every branch reads the stream through an RMSNorm, which ignores overall scale, and the stream
+ends in norm_out. So forward hooks divide what enters the stream (proj_in, self-attention,
+cross-attention and MLP outputs) by 64, and the stream-reading norms' epsilon by 64**2: the
+decoder output is bit-identical in float32, no weights are modified, and LoRA/LoKr adapters
+inside those branches are scaled together with them.
+
+Limits: each branch output must fit float16 before the division (measured <= ~30,000), and the
+unscaled stream must stay under 64 * 65,504 (measured 1.36 million). The raw stream returned by
+forward(return_hidden_states=...) is scaled too (no in-repo callers).
+
+The fix lives in a new module (fp16_dit_stream.py); the loader calls it only when the model
+dtype is float16, and it logs a warning if the decoder is not recognised.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../generation/handler/fp16_dit_stream.py     | 110 ++++++++++
+ .../handler/fp16_dit_stream_loader_test.py    |  72 +++++++
+ .../handler/fp16_dit_stream_model_test.py     | 114 ++++++++++
+ .../handler/fp16_dit_stream_test.py           | 194 ++++++++++++++++++
+ .../generation/handler/init_service_loader.py |   3 +
+ 5 files changed, 493 insertions(+)
+ create mode 100644 acestep/core/generation/handler/fp16_dit_stream.py
+ create mode 100644 acestep/core/generation/handler/fp16_dit_stream_loader_test.py
+ create mode 100644 acestep/core/generation/handler/fp16_dit_stream_model_test.py
+ create mode 100644 acestep/core/generation/handler/fp16_dit_stream_test.py
+
+diff --git a/acestep/core/generation/handler/fp16_dit_stream.py b/acestep/core/generation/handler/fp16_dit_stream.py
+new file mode 100644
+index 0000000..adde9c7
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_dit_stream.py
+@@ -0,0 +1,110 @@
++"""Keep the DiT decoder's residual stream inside float16's range.
++
++Each decoder layer adds gated branch outputs to a residual stream. In float16 the gated product
++and the stream overflow 65,504 -- e.g. |x| ~ 137,000 at layers.20 of the 2B sft model and ~1.36
++million at layers.18 of xl-sft (float32 measurements) -- and every latent turns NaN.
++
++Every branch reads the stream through an RMSNorm, which ignores overall scale, and the stream ends
++in ``norm_out``. So dividing what enters the stream by a power of two -- and those norms' epsilon
++by its square -- leaves the decoder's output unchanged (bit for bit in float32). It is done with
++forward hooks on the branch modules: no weight is modified, and adapters inside a branch (LoRA /
++LoKr on ``o_proj`` etc.) are scaled together with it.
++
++Limits: each branch output must still fit float16 before it is divided (measured: <= ~30,000),
++and the unscaled stream must stay under ``factor * 65,504`` (~4.2 million at 64; measured: 1.36
++million). The raw stream returned by ``forward(return_hidden_states=...)`` is scaled too (no
++in-repo callers).
++"""
++
++import functools
++import math
++from typing import Optional
++
++import torch
++from loguru import logger
++
++STREAM_SCALE = 64.0
++_BRANCHES = (
++    ("self_attn", "self_attn_norm"), ("cross_attn", "cross_attn_norm"), ("mlp", "mlp_norm"),
++)
++
++
++def _divide_first_output(module: torch.nn.Module, args: tuple, output, factor: float):
++    """Forward hook: divide a module's output (or a tuple output's first element) by ``factor``."""
++    if isinstance(output, tuple):
++        return (output[0] / factor,) + tuple(output[1:])
++    return output / factor
++
++
++def _stream_writers_and_readers(decoder: torch.nn.Module) -> Optional[tuple[list, list]]:
++    """Return (modules whose outputs enter the stream, norms that read it), or None if unknown.
++
++    None unless every stream reader is an RMSNorm-style norm with a float ``variance_epsilon``,
++    because only then is the rescale exact.
++    """
++    layers = getattr(decoder, "layers", None)
++    proj_in = getattr(decoder, "proj_in", None)
++    if not isinstance(layers, torch.nn.ModuleList) or not isinstance(proj_in, torch.nn.Module):
++        return None
++    writers, readers = [proj_in], [getattr(decoder, "norm_out", None)]
++    for layer in layers:
++        for branch_name, norm_name in _BRANCHES:
++            branch = getattr(layer, branch_name, None)
++            if branch is None and branch_name == "cross_attn":
++                continue
++            writers.append(branch)
++            readers.append(getattr(layer, norm_name, None))
++    if not all(isinstance(m, torch.nn.Module) for m in writers):
++        return None
++    if not all(isinstance(getattr(n, "variance_epsilon", None), float) for n in readers):
++        return None
++    return writers, readers
++
++
++def rescale_dit_residual_stream(model: torch.nn.Module, factor: float = STREAM_SCALE) -> bool:
++    """Scale the DiT decoder's residual stream down by ``factor`` without changing its output.
++
++    Args:
++        model: The loaded ACE-Step model (``model.decoder``).
++        factor: A power of two (exact in floating point).
++
++    Returns:
++        True if the decoder has the expected shape and is now (or already was) rescaled.
++
++    Raises:
++        ValueError: If ``factor`` is not a positive power of two.
++    """
++    if factor <= 0 or math.frexp(factor)[0] != 0.5:
++        raise ValueError(f"factor must be a positive power of two, got {factor}")
++    decoder = getattr(model, "decoder", None)
++    applied = getattr(decoder, "_acestep_stream_scale", None)
++    if applied is not None:
++        if applied != factor:
++            logger.warning(
++                f"DiT stream already scaled by 1/{applied:g}; not rescaling to 1/{factor:g}."
++            )
++        return True
++    found = _stream_writers_and_readers(decoder) if decoder is not None else None
++    if found is None:
++        return False
++    writers, readers = found
++    hook = functools.partial(_divide_first_output, factor=factor)
++    for module in writers:
++        module.register_forward_hook(hook)
++    for norm in {id(n): n for n in readers}.values():  # a norm shared by two layers: scale once
++        norm.variance_epsilon /= factor * factor
++    decoder._acestep_stream_scale = factor
++    return True
++
++
++def apply_float16_dit_stream_fix(model: torch.nn.Module) -> None:
++    """Apply ``rescale_dit_residual_stream`` to a float16 model and log the outcome."""
++    if rescale_dit_residual_stream(model):
++        logger.info(
++            f"[initialize_service] float16 model: DiT residual stream scaled by 1/{STREAM_SCALE:g}."
++        )
++    else:
++        logger.warning(
++            "[initialize_service] float16 model: DiT decoder not recognised; "
++            "CFG and XL models may produce NaN."
++        )
+diff --git a/acestep/core/generation/handler/fp16_dit_stream_loader_test.py b/acestep/core/generation/handler/fp16_dit_stream_loader_test.py
+new file mode 100644
+index 0000000..5477ae6
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_dit_stream_loader_test.py
+@@ -0,0 +1,72 @@
++"""Tests that the model loader applies the DiT residual-stream rescale only to float16 models."""
++
++import os
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import init_service_loader as LOADER
++
++
++class _Host(LOADER.InitServiceLoaderMixin):
++    """Just enough of the handler for _load_main_model_from_checkpoint."""
++
++    def __init__(self, dtype: torch.dtype):
++        """Store the dtype the loader should see."""
++        self.dtype, self.model = dtype, None
++        self.offload_to_cpu, self.offload_dit_to_cpu = False, False
++
++    def is_flash_attention_available(self, _device: str) -> bool:
++        """Flash attention is never available here."""
++        return False
++
++    def _sync_alignment_config(self):
++        """No-op stub."""
++
++    def _apply_cuda_bool_argsort_workaround(self):
++        """No-op stub."""
++
++
++class _LoadedModel(nn.Module):
++    """What the mocked from_pretrained returns."""
++
++    def __init__(self):
++        """Give it the config attribute the loader sets."""
++        super().__init__()
++        self.config = types.SimpleNamespace(_attn_implementation="sdpa")
++
++
++class LoaderAppliesTheFixOnlyInFloat16Tests(unittest.TestCase):
++    """_load_main_model_from_checkpoint calls the fix for float16 models only."""
++
++    def _load(self, dtype: torch.dtype):
++        """Run the loader with a mocked model; return the host and the mocked fix."""
++        host = _Host(dtype)
++        with tempfile.TemporaryDirectory() as tmpdir:
++            torch.save(torch.zeros(1, 1, 1), os.path.join(tmpdir, "silence_latent.pt"))
++            with patch("torch.cuda.is_available", return_value=False), \
++                    patch("transformers.AutoModel.from_pretrained", return_value=_LoadedModel()), \
++                    patch.object(LOADER, "apply_float16_dit_stream_fix") as fix:
++                host._load_main_model_from_checkpoint(
++                    model_checkpoint_path=tmpdir, device="cpu", use_flash_attention=False,
++                    compile_model=False, quantization=None,
++                )
++        return host, fix
++
++    def test_float16_applies_it_to_the_model(self):
++        """float16: called once, with the loaded model."""
++        host, fix = self._load(torch.float16)
++        fix.assert_called_once_with(host.model)
++
++    def test_bfloat16_and_float32_do_not(self):
++        """bfloat16 and float32: never called."""
++        self.assertEqual(self._load(torch.bfloat16)[1].call_count, 0)
++        self.assertEqual(self._load(torch.float32)[1].call_count, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/fp16_dit_stream_model_test.py b/acestep/core/generation/handler/fp16_dit_stream_model_test.py
+new file mode 100644
+index 0000000..36c3885
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_dit_stream_model_test.py
+@@ -0,0 +1,114 @@
++"""Tests for scaling the DiT residual stream on a tiny real AceStepDiTModel (XL variant).
++
++The DiT layer and model code is identical across the six model files apart from whitespace.
++"""
++
++import copy
++import unittest
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import fp16_dit_stream as FIX
++from acestep.models.common.configuration_acestep_v15 import AceStepConfig
++from acestep.models.xl_base import modeling_acestep_v15_xl_base as MODELING
++
++
++class _Wrapper(nn.Module):
++    """``model.decoder`` around a real AceStepDiTModel."""
++
++    def __init__(self, decoder: nn.Module):
++        """Hold the decoder."""
++        super().__init__()
++        self.decoder = decoder
++
++
++def _model(mlp_gate_offset: float = 0.0) -> _Wrapper:
++    """Build a tiny real decoder; a large MLP-gate offset makes its stream overflow float16."""
++    config = AceStepConfig(
++        hidden_size=64, intermediate_size=128, num_hidden_layers=4, num_attention_heads=4,
++        num_key_value_heads=2, head_dim=16, in_channels=24, audio_acoustic_hidden_dim=8,
++        sliding_window=4, layer_types=["sliding_attention", "full_attention"] * 2,
++    )
++    config.encoder_hidden_size = 48
++    config._attn_implementation = "eager"
++    torch.manual_seed(0)
++    decoder = MODELING.AceStepDiTModel(config)
++    with torch.no_grad():  # make the modulation and gates non-trivial
++        for p in decoder.parameters():
++            p.add_(torch.randn_like(p) * 0.05)
++        for layer in decoder.layers:
++            layer.scale_shift_table.mul_(20)
++            layer.scale_shift_table[:, 5].add_(mlp_gate_offset)
++    return _Wrapper(decoder).eval()
++
++
++def _run(model: _Wrapper, dtype: torch.dtype) -> torch.Tensor:
++    """Run the decoder on fixed random inputs in ``dtype``; return its output in float32."""
++    g = torch.Generator().manual_seed(1)
++
++    def rand(*shape):
++        return torch.randn(*shape, generator=g).to(dtype)
++
++    batch, frames = 2, 13
++    with torch.no_grad():
++        out = model.decoder(
++            hidden_states=rand(batch, frames, 8), context_latents=rand(batch, frames, 16),
++            timestep=torch.rand(batch, generator=g).to(dtype),
++            timestep_r=torch.zeros(batch).to(dtype),
++            attention_mask=torch.ones(batch, frames).to(dtype),
++            encoder_hidden_states=rand(batch, 7, 48),
++            encoder_attention_mask=torch.ones(batch, 7).to(dtype),
++        )
++    return (out[0] if isinstance(out, tuple) else out).float()
++
++
++class RealDecoderTests(unittest.TestCase):
++    """rescale_dit_residual_stream on the real AceStepDiTModel."""
++
++    def test_float32_output_is_bit_identical(self):
++        """Dividing by a power of two (and epsilon by its square) changes nothing in float32."""
++        model = _model()
++        before = _run(model, torch.float32)
++        self.assertTrue(FIX.rescale_dit_residual_stream(model))
++        self.assertTrue(torch.equal(before, _run(model, torch.float32)))
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: a stream peaking ~237K overflows float16 unscaled, not once rescaled."""
++        model = _model(mlp_gate_offset=10000.0)
++        reference = _run(model, torch.float32)
++        stock = copy.deepcopy(model).half()
++        self.assertFalse(torch.isfinite(_run(stock, torch.float16)).all())
++        fixed = copy.deepcopy(model).half()
++        FIX.rescale_dit_residual_stream(fixed)
++        out = _run(fixed, torch.float16)
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertLess(((out - reference).norm() / reference.norm()).item(), 5e-2)
++
++    def test_peft_lora_has_its_normal_effect_and_unwrapping_keeps_the_fix(self):
++        """A PEFT LoRA on q/k/v/o_proj acts as without the rescale; get_base_model keeps hooks."""
++        from peft import LoraConfig, get_peft_model
++
++        def with_lora(model: _Wrapper) -> _Wrapper:
++            targets = ["q_proj", "k_proj", "v_proj", "o_proj"]
++            lora = LoraConfig(r=4, lora_alpha=8, target_modules=targets)
++            model.decoder = get_peft_model(model.decoder, lora)
++            torch.manual_seed(2)
++            with torch.no_grad():
++                for name, p in model.decoder.named_parameters():
++                    if "lora_B" in name:
++                        p.normal_(0.0, 0.2)
++            return model
++
++        reference = with_lora(_model())
++        scaled = _model()
++        FIX.rescale_dit_residual_stream(scaled)
++        scaled = with_lora(scaled)
++        self.assertTrue(torch.allclose(_run(reference, torch.float32), _run(scaled, torch.float32),
++                                       rtol=1e-5, atol=1e-5))
++        scaled.decoder = scaled.decoder.get_base_model()
++        self.assertEqual(len(scaled.decoder.layers[0].mlp._forward_hooks), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/fp16_dit_stream_test.py b/acestep/core/generation/handler/fp16_dit_stream_test.py
+new file mode 100644
+index 0000000..6e05e17
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_dit_stream_test.py
+@@ -0,0 +1,194 @@
++"""Unit tests for scaling the DiT residual stream on float16 models (fake decoder).
++
++The fake decoder mirrors AceStepDiTLayer's residual pattern: gated self-attention returning a tuple,
++ungated cross-attention, gated MLP, and Qwen3RMSNorm-style norms. fp16_dit_stream_model_test.py
++runs the real AceStepDiTModel, including a real PEFT LoRA.
++"""
++
++import unittest
++from unittest.mock import patch
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import fp16_dit_stream as FIX
++
++
++class _RMSNorm(nn.Module):
++    """Same arithmetic and attribute name as Qwen3RMSNorm."""
++
++    def __init__(self, d: int, eps: float = 1e-6):
++        """Create the weight and epsilon."""
++        super().__init__()
++        self.weight = nn.Parameter(torch.ones(d))
++        self.variance_epsilon = eps
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Normalise in float32 and return in the input dtype."""
++        h = x.float()
++        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
++        return self.weight * h.to(x.dtype)
++
++
++class _Attn(nn.Module):
++    """Returns (output, weights) like AceStepAttention."""
++
++    def __init__(self, d: int):
++        """Create the projections."""
++        super().__init__()
++        self.v = nn.Linear(d, d)
++        self.o_proj = nn.Linear(d, d)
++
++    def forward(self, x: torch.Tensor):
++        """Return a nonlinear projection and no attention weights."""
++        return self.o_proj(torch.tanh(self.v(x))), None
++
++
++class _MLP(nn.Module):
++    """A two-layer MLP with a ``down_proj``."""
++
++    def __init__(self, d: int):
++        """Create the projections."""
++        super().__init__()
++        self.up = nn.Linear(d, 2 * d)
++        self.down_proj = nn.Linear(2 * d, d)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Return the MLP output."""
++        return self.down_proj(torch.relu(self.up(x)))
++
++
++class _Layer(nn.Module):
++    """Gated self-attention, ungated cross-attention, gated MLP, each read through a norm."""
++
++    def __init__(self, d: int, gate: float):
++        """Create the branches, norms and a fixed gate."""
++        super().__init__()
++        self.self_attn_norm, self.cross_attn_norm = _RMSNorm(d), _RMSNorm(d)
++        self.mlp_norm = _RMSNorm(d)
++        self.self_attn, self.cross_attn, self.mlp = _Attn(d), _Attn(d), _MLP(d)
++        self.gate = gate
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Add the three branches to the stream."""
++        x = x + self.self_attn(self.self_attn_norm(x))[0] * self.gate
++        x = x + self.cross_attn(self.cross_attn_norm(x))[0]
++        return x + self.mlp(self.mlp_norm(x)) * self.gate
++
++
++class _Model(nn.Module):
++    """``model.decoder`` with proj_in, layers and norm_out."""
++
++    def __init__(self, gate: float = 40.0):
++        """Create a three-layer decoder."""
++        super().__init__()
++        self.decoder = nn.Module()
++        self.decoder.proj_in = nn.Sequential(nn.Linear(8, 16))
++        self.decoder.layers = nn.ModuleList([_Layer(16, gate) for _ in range(3)])
++        self.decoder.norm_out = _RMSNorm(16)
++        self.decoder.proj_out = nn.Linear(16, 8)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """Run the decoder."""
++        h = self.decoder.proj_in(x)
++        for layer in self.decoder.layers:
++            h = layer(h)
++        return self.decoder.proj_out(self.decoder.norm_out(h))
++
++
++class RescaleDitResidualStreamTests(unittest.TestCase):
++    """rescale_dit_residual_stream on the fake decoder."""
++
++    def setUp(self):
++        """A fixed input."""
++        torch.manual_seed(0)
++        self.x = torch.randn(2, 5, 8) * 50
++
++    def _same(self, a: torch.Tensor, b: torch.Tensor) -> bool:
++        """Whether two outputs match to float32 rounding."""
++        return torch.allclose(a, b, rtol=1e-4, atol=1e-4)
++
++    def test_output_is_unchanged(self):
++        """The decoder's output is the same after rescaling."""
++        model = _Model()
++        before = model(self.x)
++        self.assertTrue(FIX.rescale_dit_residual_stream(model))
++        self.assertTrue(self._same(before, model(self.x)))
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: the stream overflows float16 unscaled and is finite once rescaled."""
++        model = _Model(gate=300000.0).half()
++        x = self.x.half()
++        self.assertFalse(torch.isfinite(model(x)).all())
++        FIX.rescale_dit_residual_stream(model)
++        self.assertTrue(torch.isfinite(model(x)).all())
++
++    def test_no_weight_is_changed(self):
++        """Only hooks and norm epsilons change; the state_dict is identical."""
++        model = _Model()
++        before = {k: v.clone() for k, v in model.state_dict().items()}
++        FIX.rescale_dit_residual_stream(model)
++        self.assertTrue(all(torch.equal(before[k], v) for k, v in model.state_dict().items()))
++
++    def test_a_small_stream_is_unchanged_too(self):
++        """Where the norms' epsilon matters, it must be scaled with the stream (control below)."""
++        model = _Model(gate=1.0)
++        x = self.x * 2e-5
++        before = model(x)
++        FIX.rescale_dit_residual_stream(model)
++        self.assertTrue(self._same(before, model(x)))
++        for m in model.modules():
++            if isinstance(m, _RMSNorm):
++                m.variance_epsilon = 1e-6
++        self.assertFalse(self._same(before, model(x)))
++
++    def test_q_k_norms_are_not_touched(self):
++        """Norms that read q and k, not the stream, keep their epsilon."""
++        model = _Model()
++        q_norm = _RMSNorm(4)
++        model.decoder.layers[0].self_attn.q_norm = q_norm
++        FIX.rescale_dit_residual_stream(model)
++        self.assertEqual(q_norm.variance_epsilon, 1e-6)
++
++    def test_applying_twice_scales_once(self):
++        """A second call adds no hooks and leaves epsilon alone; a different factor warns."""
++        model = _Model()
++        FIX.rescale_dit_residual_stream(model)
++        with patch.object(FIX.logger, "warning") as warning:
++            self.assertTrue(FIX.rescale_dit_residual_stream(model))
++            self.assertTrue(FIX.rescale_dit_residual_stream(model, factor=128.0))
++        self.assertEqual(warning.call_count, 1)
++        self.assertEqual(len(model.decoder.layers[0].mlp._forward_hooks), 1)
++        self.assertEqual(model.decoder.norm_out.variance_epsilon, 1e-6 / 64 / 64)
++
++    def test_a_shared_norm_is_scaled_once(self):
++        """A norm module used by two layers gets its epsilon divided once."""
++        model = _Model()
++        shared = model.decoder.layers[0].mlp_norm
++        model.decoder.layers[1].mlp_norm = shared
++        FIX.rescale_dit_residual_stream(model)
++        self.assertEqual(shared.variance_epsilon, 1e-6 / 64 / 64)
++
++    def test_unrecognised_decoders_are_left_alone(self):
++        """No decoder, or a stream reader without an RMS epsilon: nothing changes."""
++        self.assertFalse(FIX.rescale_dit_residual_stream(nn.Linear(4, 4)))
++        model = _Model()
++        model.decoder.norm_out = nn.LayerNorm(16)
++        self.assertFalse(FIX.rescale_dit_residual_stream(model))
++        self.assertEqual(len(model.decoder.layers[0].mlp._forward_hooks), 0)
++
++    def test_factor_must_be_a_power_of_two(self):
++        """Only powers of two are exact."""
++        with self.assertRaises(ValueError):
++            FIX.rescale_dit_residual_stream(_Model(), factor=50.0)
++
++    def test_apply_warns_when_not_recognised(self):
++        """apply_float16_dit_stream_fix logs a warning if nothing could be rescaled."""
++        with patch.object(FIX.logger, "warning") as warning, patch.object(FIX.logger, "info"):
++            FIX.apply_float16_dit_stream_fix(nn.Linear(4, 4))
++            FIX.apply_float16_dit_stream_fix(_Model())
++        self.assertEqual(warning.call_count, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 040c5ce..8bdee73 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -8,6 +8,7 @@ import torch
+ from loguru import logger
+ 
+ from acestep import gpu_config
++from .fp16_dit_stream import apply_float16_dit_stream_fix
+ from .init_service_loader_components import InitServiceLoaderComponentsMixin
+ 
+ 
+@@ -202,6 +203,8 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+         else:
+             self.model = self.model.to("cpu").to(self.dtype)
+         self.model.eval()
++        if self.dtype == torch.float16:
++            apply_float16_dit_stream_fix(self.model)
+ 
+         if compile_model:
+             self._ensure_len_for_compile(self.model, "model")
+-- 
+2.43.0
+

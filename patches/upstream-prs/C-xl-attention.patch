@@ -1,0 +1,451 @@
+From ece4786d41aa5cf2d176fcd0034178ec5c49e972 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 06:37:07 -0500
+Subject: [PATCH] fix(cuda): apply the attention score scale to the queries on
+ float16 models
+
+Eager attention, which ACE-Step uses on pre-Ampere GPUs, computes matmul(q, k^T) in the model
+dtype and only then multiplies by 1/sqrt(head_dim). In the XL checkpoints decoder.layers.0's
+q_norm and k_norm weights reach ~31.6 each, so one q.k over 128 dims can reach ~128,000 -- past
+float16's 65,504 -- and every latent turns NaN in the XL models.
+
+A forward hook multiplies q_norm's output by the scale (before RoPE, a rotation, which
+commutes) and the module's scaling is set to 1.0: the same scores, up to float16 rounding,
+come out of the matmul already scaled. It applies to every AceStepAttention (matched by class
+name) in a float16 model -- all model sizes and attention backends; no weights are modified.
+
+The fix lives in a new module (fp16_attention_scale.py); the loader calls it only when the model
+dtype is float16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../handler/fp16_attention_scale.py           |  72 +++++++++
+ .../fp16_attention_scale_loader_test.py       |  72 +++++++++
+ .../fp16_attention_scale_model_test.py        |  85 +++++++++++
+ .../handler/fp16_attention_scale_test.py      | 141 ++++++++++++++++++
+ .../generation/handler/init_service_loader.py |   3 +
+ 5 files changed, 373 insertions(+)
+ create mode 100644 acestep/core/generation/handler/fp16_attention_scale.py
+ create mode 100644 acestep/core/generation/handler/fp16_attention_scale_loader_test.py
+ create mode 100644 acestep/core/generation/handler/fp16_attention_scale_model_test.py
+ create mode 100644 acestep/core/generation/handler/fp16_attention_scale_test.py
+
+diff --git a/acestep/core/generation/handler/fp16_attention_scale.py b/acestep/core/generation/handler/fp16_attention_scale.py
+new file mode 100644
+index 0000000..cc86e7c
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_attention_scale.py
+@@ -0,0 +1,72 @@
++"""Apply the attention score scale to the queries instead of the scores on float16 models.
++
++Eager attention, which ACE-Step uses on pre-Ampere GPUs, computes ``matmul(q, k^T)`` in the model
++dtype and only then multiplies by ``scaling`` (1/sqrt(head_dim)). In the XL checkpoints
++``decoder.layers.0``'s ``q_norm`` and ``k_norm`` weights reach ~31.6 each, so one q.k over 128
++dims can reach ~128,000 -- past float16's 65,504 -- and every latent turns NaN.
++
++A forward hook multiplies ``q_norm``'s output by ``scaling`` (before RoPE, a rotation, which
++commutes with it) and the module's ``scaling`` is set to 1.0, so the same scores -- up to float16
++rounding -- come out of the matmul already scaled. It applies to every ``AceStepAttention`` in a
++float16 model (decoder and encoders, all model sizes, any attention backend); no weight is changed.
++"""
++
++import functools
++
++import torch
++from loguru import logger
++
++# Each model file defines its own copy of the class (loaded with trust_remote_code), so match by
++# name. Look-alikes such as nano-vllm's Qwen3Attention copy ``scaling`` at construction time and
++# must not be touched.
++_ATTENTION_CLASS = "AceStepAttention"
++
++
++def _multiply_output(
++    module: torch.nn.Module, args: tuple, output: torch.Tensor, scale: float
++) -> torch.Tensor:
++    """Forward hook: multiply a module's output by ``scale``."""
++    return output * scale
++
++
++def apply_attention_scale_to_queries(model: torch.nn.Module) -> int:
++    """Move each AceStepAttention's score scale onto its queries.
++
++    The original scale is kept on the attention module, so the hook is restored if ``q_norm`` is
++    ever replaced, and a second call changes nothing.
++
++    Args:
++        model: The loaded ACE-Step model.
++
++    Returns:
++        How many attention modules got the hook in this call.
++    """
++    hooked = 0
++    for module in model.modules():
++        if type(module).__name__ != _ATTENTION_CLASS:
++            continue
++        q_norm = getattr(module, "q_norm", None)
++        if not isinstance(q_norm, torch.nn.Module):
++            continue
++        scale = getattr(module, "_acestep_query_scale", None)
++        if scale is None:
++            scale = getattr(module, "scaling", None)
++            if not isinstance(scale, float):
++                continue
++            module._acestep_query_scale = scale
++            module.scaling = 1.0
++        if getattr(q_norm, "_acestep_query_scale", None) is None:
++            q_norm.register_forward_hook(functools.partial(_multiply_output, scale=scale))
++            q_norm._acestep_query_scale = scale
++            hooked += 1
++    return hooked
++
++
++def apply_float16_attention_scale_fix(model: torch.nn.Module) -> None:
++    """Apply ``apply_attention_scale_to_queries`` to a float16 model and log the outcome."""
++    hooked = apply_attention_scale_to_queries(model)
++    if hooked:
++        logger.info(
++            f"[initialize_service] float16 model: attention score scale moved to the queries "
++            f"({hooked} attention modules)."
++        )
+diff --git a/acestep/core/generation/handler/fp16_attention_scale_loader_test.py b/acestep/core/generation/handler/fp16_attention_scale_loader_test.py
+new file mode 100644
+index 0000000..1e77270
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_attention_scale_loader_test.py
+@@ -0,0 +1,72 @@
++"""Tests that the model loader applies the attention-scale move only to float16 models."""
++
++import os
++import tempfile
++import types
++import unittest
++from unittest.mock import patch
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import init_service_loader as LOADER
++
++
++class _Host(LOADER.InitServiceLoaderMixin):
++    """Just enough of the handler for _load_main_model_from_checkpoint."""
++
++    def __init__(self, dtype: torch.dtype):
++        """Store the dtype the loader should see."""
++        self.dtype, self.model = dtype, None
++        self.offload_to_cpu, self.offload_dit_to_cpu = False, False
++
++    def is_flash_attention_available(self, _device: str) -> bool:
++        """Flash attention is never available here."""
++        return False
++
++    def _sync_alignment_config(self):
++        """No-op stub."""
++
++    def _apply_cuda_bool_argsort_workaround(self):
++        """No-op stub."""
++
++
++class _LoadedModel(nn.Module):
++    """What the mocked from_pretrained returns."""
++
++    def __init__(self):
++        """Give it the config attribute the loader sets."""
++        super().__init__()
++        self.config = types.SimpleNamespace(_attn_implementation="sdpa")
++
++
++class LoaderAppliesTheFixOnlyInFloat16Tests(unittest.TestCase):
++    """_load_main_model_from_checkpoint calls the fix for float16 models only."""
++
++    def _load(self, dtype: torch.dtype):
++        """Run the loader with a mocked model; return the host and the mocked fix."""
++        host = _Host(dtype)
++        with tempfile.TemporaryDirectory() as tmpdir:
++            torch.save(torch.zeros(1, 1, 1), os.path.join(tmpdir, "silence_latent.pt"))
++            with patch("torch.cuda.is_available", return_value=False), \
++                    patch("transformers.AutoModel.from_pretrained", return_value=_LoadedModel()), \
++                    patch.object(LOADER, "apply_float16_attention_scale_fix") as fix:
++                host._load_main_model_from_checkpoint(
++                    model_checkpoint_path=tmpdir, device="cpu", use_flash_attention=False,
++                    compile_model=False, quantization=None,
++                )
++        return host, fix
++
++    def test_float16_applies_it_to_the_model(self):
++        """float16: called once, with the loaded model."""
++        host, fix = self._load(torch.float16)
++        fix.assert_called_once_with(host.model)
++
++    def test_bfloat16_and_float32_do_not(self):
++        """bfloat16 and float32: never called."""
++        self.assertEqual(self._load(torch.bfloat16)[1].call_count, 0)
++        self.assertEqual(self._load(torch.float32)[1].call_count, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/fp16_attention_scale_model_test.py b/acestep/core/generation/handler/fp16_attention_scale_model_test.py
+new file mode 100644
+index 0000000..84c1812
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_attention_scale_model_test.py
+@@ -0,0 +1,85 @@
++"""Tests for moving the attention score scale onto the queries in a whole (tiny) XL model.
++
++Covers every AceStepAttention the model has (decoder self/cross attention, lyric/timbre/condition
++encoders), grouped KV heads, sliding-window layers, the cross-attention cache, eager and SDPA.
++"""
++
++import copy
++import unittest
++
++import torch
++
++from acestep.core.generation.handler import fp16_attention_scale as FIX
++from acestep.models.common.configuration_acestep_v15 import AceStepConfig
++from acestep.models.xl_turbo import modeling_acestep_v15_xl_turbo as MODELING
++
++
++def _model(attn_implementation: str) -> MODELING.AceStepConditionGenerationModel:
++    """A tiny real XL model with non-trivial q/k norm weights."""
++    config = AceStepConfig(
++        hidden_size=384, intermediate_size=512, num_hidden_layers=4, num_attention_heads=3,
++        num_key_value_heads=1, head_dim=128, sliding_window=8, num_lyric_encoder_hidden_layers=2,
++        num_timbre_encoder_hidden_layers=1, num_attention_pooler_hidden_layers=1,
++        num_audio_decoder_hidden_layers=1, fsq_dim=256, encoder_hidden_size=256,
++        encoder_intermediate_size=512, encoder_num_attention_heads=2, encoder_num_key_value_heads=1,
++    )
++    config._attn_implementation = attn_implementation
++    torch.manual_seed(0)
++    model = MODELING.AceStepConditionGenerationModel(config).eval()
++    with torch.no_grad():
++        for module in model.modules():
++            if isinstance(module, MODELING.AceStepAttention):
++                module.q_norm.weight.normal_(3.0, 1.0)
++                module.k_norm.weight.normal_(3.0, 1.0)
++    return model
++
++
++def _generate(model: MODELING.AceStepConditionGenerationModel, use_cache: bool) -> torch.Tensor:
++    """Run three diffusion steps on fixed random inputs; return the latents."""
++    g = torch.Generator().manual_seed(1)
++
++    def rand(*shape):
++        return torch.randn(*shape, generator=g)
++
++    frames = 40
++    attention_mask = torch.ones(2, frames)
++    attention_mask[0, frames // 2:] = 0
++    with torch.no_grad():
++        out = model.generate_audio(
++            text_hidden_states=rand(2, 7, 1024), text_attention_mask=torch.ones(2, 7),
++            lyric_hidden_states=rand(2, 11, 1024), lyric_attention_mask=torch.ones(2, 11),
++            refer_audio_acoustic_hidden_states_packed=rand(3, 750, 64),
++            refer_audio_order_mask=torch.LongTensor([0, 0, 1]),
++            src_latents=rand(2, frames, 64), chunk_masks=torch.ones(2, frames, 64),
++            is_covers=torch.tensor([0, 1]), silence_latent=rand(2, frames, 64),
++            attention_mask=attention_mask, seed=3, fix_nfe=3, use_cache=use_cache,
++            dcw_enabled=False,
++        )
++    return (out["target_latents"] if isinstance(out, dict) else out[0]).float()
++
++
++class WholeModelTests(unittest.TestCase):
++    """apply_attention_scale_to_queries on a whole AceStepConditionGenerationModel."""
++
++    def test_every_attention_module_is_covered(self):
++        """It hooks exactly the model's AceStepAttention modules."""
++        model = _model("eager")
++        count = sum(isinstance(m, MODELING.AceStepAttention) for m in model.modules())
++        self.assertGreater(count, 4)
++        self.assertEqual(FIX.apply_attention_scale_to_queries(model), count)
++
++    def test_generation_is_unchanged_with_eager_and_sdpa(self):
++        """generate_audio gives the same latents, with and without the cross-attention cache."""
++        for attn_implementation in ("eager", "sdpa"):
++            model = _model(attn_implementation)
++            moved = copy.deepcopy(model)
++            FIX.apply_attention_scale_to_queries(moved)
++            for use_cache in (True, False):
++                with self.subTest(attn=attn_implementation, use_cache=use_cache):
++                    before, after = _generate(model, use_cache), _generate(moved, use_cache)
++                    scale = before.abs().max()
++                    self.assertLess(((after - before).abs().max() / scale).item(), 1e-5)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/fp16_attention_scale_test.py b/acestep/core/generation/handler/fp16_attention_scale_test.py
+new file mode 100644
+index 0000000..2d1aec1
+--- /dev/null
++++ b/acestep/core/generation/handler/fp16_attention_scale_test.py
+@@ -0,0 +1,141 @@
++"""Tests for moving the attention score scale onto the queries on float16 models.
++
++The XL checkpoints' decoder.layers.0 q_norm/k_norm weights reach ~31.6 each, so eager attention's
++unscaled matmul(q, k^T) can reach ~128,000 -- past float16's 65,504 -- and every latent turns NaN.
++These tests use the real XL AceStepAttention (the other model files carry identical copies) with
++transformers' eager attention and RoPE. fp16_attention_scale_model_test.py runs a whole model.
++"""
++
++import copy
++import unittest
++from unittest.mock import patch
++
++import torch
++from torch import nn
++from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
++
++from acestep.core.generation.handler import fp16_attention_scale as FIX
++from acestep.models.common.configuration_acestep_v15 import AceStepConfig
++from acestep.models.xl_turbo.modeling_acestep_v15_xl_turbo import AceStepAttention
++
++
++def _config() -> AceStepConfig:
++    """A one-head, 128-dim attention config (like the XL models' head_dim)."""
++    config = AceStepConfig(
++        hidden_size=128, num_attention_heads=1, num_key_value_heads=1, head_dim=128,
++        layer_types=["full_attention"], attention_bias=False,
++    )
++    config._attn_implementation = "eager"
++    return config
++
++
++def _attention(norm_weight: float = 1.0, cross: bool = False) -> AceStepAttention:
++    """A real AceStepAttention with identity projections and q/k norm weights of ``norm_weight``."""
++    torch.manual_seed(0)
++    attn = AceStepAttention(_config(), layer_idx=0, is_cross_attention=cross)
++    with torch.no_grad():
++        attn.q_proj.weight.copy_(torch.eye(128))
++        attn.k_proj.weight.copy_(torch.eye(128))
++        attn.q_norm.weight.fill_(norm_weight)
++        attn.k_norm.weight.fill_(norm_weight)
++    return attn
++
++
++def _self(attn: nn.Module, x: torch.Tensor) -> torch.Tensor:
++    """Self-attention with RoPE."""
++    rope = Qwen3RotaryEmbedding(config=_config())
++    cos, sin = rope(x.float(), torch.arange(x.shape[1]).unsqueeze(0))
++    return attn(x, attention_mask=None, position_embeddings=(cos.to(x.dtype), sin.to(x.dtype)))[0]
++
++
++class MoveScaleToQueriesTests(unittest.TestCase):
++    """apply_attention_scale_to_queries on single attention modules."""
++
++    def test_self_attention_with_rope_is_unchanged(self):
++        """Same output with the scale on the queries, RoPE included."""
++        attn = _attention(norm_weight=3.0)
++        x = torch.randn(1, 6, 128)
++        before = _self(attn, x)
++        self.assertEqual(FIX.apply_attention_scale_to_queries(attn), 1)
++        self.assertEqual(attn.scaling, 1.0)
++        self.assertTrue(torch.allclose(before, _self(attn, x), rtol=1e-4, atol=1e-5))
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: w=31.6 (XL layer 0) overflows float16 unless the scale is moved."""
++        x = torch.ones(1, 2, 128)   # two identical tokens: q.k = 128 * w^2 = ~128,000
++        reference = _self(_attention(norm_weight=31.6), x)
++        attn = _attention(norm_weight=31.6).half()
++        self.assertFalse(torch.isfinite(_self(attn, x.half())).all())
++        FIX.apply_attention_scale_to_queries(attn)
++        out = _self(attn, x.half())
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertTrue(torch.allclose(out.float(), reference, rtol=1e-2, atol=1e-2))
++
++    def test_cross_attention_and_its_weights_are_unchanged(self):
++        """Cross-attention output and the attention weights it returns are the same."""
++        attn = _attention(norm_weight=3.0, cross=True)
++        x, enc = torch.randn(1, 9, 128), torch.randn(1, 5, 128)
++        before = attn(x, None, encoder_hidden_states=enc, output_attentions=True)
++        FIX.apply_attention_scale_to_queries(attn)
++        after = attn(x, None, encoder_hidden_states=enc, output_attentions=True)
++        self.assertTrue(torch.allclose(before[0], after[0], rtol=1e-4, atol=1e-5))
++        self.assertTrue(torch.allclose(before[1], after[1], rtol=1e-4, atol=1e-6))
++
++    def test_no_weight_is_changed(self):
++        """Only a hook and an attribute change; the state_dict is identical."""
++        attn = _attention(norm_weight=3.0)
++        before = {k: v.clone() for k, v in attn.state_dict().items()}
++        FIX.apply_attention_scale_to_queries(attn)
++        self.assertTrue(all(torch.equal(before[k], v) for k, v in attn.state_dict().items()))
++
++    def test_applying_twice_changes_nothing(self):
++        """A second call hooks nothing and gives the same output."""
++        attn = _attention(norm_weight=3.0)
++        x = torch.randn(1, 6, 128)
++        FIX.apply_attention_scale_to_queries(attn)
++        once = _self(attn, x)
++        self.assertEqual(FIX.apply_attention_scale_to_queries(attn), 0)
++        self.assertTrue(torch.equal(once, _self(attn, x)))
++
++    def test_a_replaced_q_norm_gets_the_scale_back(self):
++        """If q_norm is swapped for a fresh module, a second call restores the original scale."""
++        attn = _attention(norm_weight=0.3)   # small enough that the score scale matters
++        x = torch.randn(1, 6, 128)
++        before = _self(attn, x)
++        unscaled = copy.deepcopy(attn)
++        unscaled.scaling = 1.0
++        self.assertFalse(torch.allclose(before, _self(unscaled, x), rtol=1e-4, atol=1e-5))
++        fresh_q_norm = copy.deepcopy(attn.q_norm)
++        FIX.apply_attention_scale_to_queries(attn)
++        attn.q_norm = fresh_q_norm
++        self.assertEqual(FIX.apply_attention_scale_to_queries(attn), 1)
++        self.assertTrue(torch.allclose(before, _self(attn, x), rtol=1e-4, atol=1e-5))
++
++    def test_other_classes_are_left_alone(self):
++        """Look-alikes (q_norm + float scaling, another class name) and LoRA layers: untouched."""
++        class Qwen3Attention(nn.Module):
++            """nano-vllm-style look-alike that copies scaling at construction."""
++
++            def __init__(self):
++                """Give it a q_norm and a float scaling."""
++                super().__init__()
++                self.q_norm = nn.LayerNorm(4)
++                self.scaling = 0.5
++
++        lora_like = nn.Linear(4, 4)
++        lora_like.scaling = {"default": 2.0}
++        modules = nn.ModuleList([Qwen3Attention(), lora_like])
++        self.assertEqual(FIX.apply_attention_scale_to_queries(modules), 0)
++        self.assertEqual(modules[0].scaling, 0.5)
++        self.assertEqual(len(modules[0].q_norm._forward_hooks), 0)
++
++    def test_apply_logs_what_it_did(self):
++        """apply_float16_attention_scale_fix logs only when something was hooked."""
++        with patch.object(FIX.logger, "info") as info:
++            FIX.apply_float16_attention_scale_fix(nn.Linear(4, 4))
++            FIX.apply_float16_attention_scale_fix(_attention())
++        self.assertEqual(info.call_count, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 040c5ce..907749d 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -8,6 +8,7 @@ import torch
+ from loguru import logger
+ 
+ from acestep import gpu_config
++from .fp16_attention_scale import apply_float16_attention_scale_fix
+ from .init_service_loader_components import InitServiceLoaderComponentsMixin
+ 
+ 
+@@ -202,6 +203,8 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+         else:
+             self.model = self.model.to("cpu").to(self.dtype)
+         self.model.eval()
++        if self.dtype == torch.float16:
++            apply_float16_attention_scale_fix(self.model)
+ 
+         if compile_model:
+             self._ensure_len_for_compile(self.model, "model")
+-- 
+2.43.0
+
