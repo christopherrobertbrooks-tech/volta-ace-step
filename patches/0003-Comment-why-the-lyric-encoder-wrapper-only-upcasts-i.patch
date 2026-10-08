@@ -1,0 +1,27 @@
+From 3dcc6a36d9d4a68251129c6864f1b73bd030b043 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 21:37:58 -0500
+Subject: [PATCH 3/3] Comment why the lyric-encoder wrapper only upcasts
+ inputs_embeds
+
+---
+ acestep/core/generation/handler/init_service_loader.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index b02175f..99e574c 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -30,6 +30,8 @@ def _keep_lyric_encoder_in_float32(model) -> bool:
+     encoder.float()
+     original_forward = encoder.forward
+ 
++    # Only inputs_embeds needs upcasting: AceStepLyricEncoder.forward asserts input_ids is None and projects
++    # inputs_embeds through a Linear, and the integer attention_mask passes through unchanged.
+     def forward(*args, inputs_embeds=None, **kwargs):
+         out_dtype = inputs_embeds.dtype if inputs_embeds is not None else None
+         if inputs_embeds is not None:
+-- 
+2.43.0
+

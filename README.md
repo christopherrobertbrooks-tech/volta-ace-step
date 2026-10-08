@@ -78,7 +78,23 @@ Against `ace-step/ACE-Step-1.5` at `ca1e85f`; apply with `git am patches/*.patch
 2. `0002` -- keep the lyric encoder in float32 when the model runs in float16 (`_keep_lyric_encoder_in_float32()`,
    4 tests). This is the one that makes pre-Ampere cards work at full FP16 speed.
 
+3. `0003` -- a comment on why the wrapper only upcasts `inputs_embeds` (`AceStepLyricEncoder.forward` asserts
+   `input_ids is None`; the integer attention mask passes through).
+
 Not yet proposed upstream: tests 2-5 below come first.
+
+### Open question for the maintainers: loader-side wrapper or model-side dtype handling?
+
+Fix 2 wraps `lyric_encoder.forward` in the loader. The model-side alternative is Transformers' own hook,
+`_keep_in_fp32_modules = ["lyric_encoder"]` on `AceStepPreTrainedModel`, plus an upcast in
+`AceStepLyricEncoder.forward` and a cast back in `AceStepConditionEncoder`. Trade-offs:
+
+- **Model-side** is the more idiomatic Transformers pattern, but the lyric encoder is duplicated in **six** model
+  files (`base`, `sft`, `turbo`, `xl_base`, `xl_sft`, `xl_turbo`), and the loader's `self.model.to(device).to(self.dtype)`
+  right after `from_pretrained` would cast the module back to float16 anyway -- so it needs a loader change too.
+- **Loader-side** (this patch) is one place, covers every variant, and runs after that `.to(dtype)`.
+
+We'll offer both in the PR and follow the maintainers' preference.
 
 ## Still to check
 
