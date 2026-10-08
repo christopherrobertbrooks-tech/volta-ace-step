@@ -70,6 +70,23 @@ fix 2, seed 1234, a hook on every layer. Max |value| per part; FP16's limit is 6
 - The VAE hooks recorded nothing (max 0) -- the decoder-to-audio step isn't covered by this probe yet; the audio
   itself is fine (RMS 0.12-0.18, no NaN).
 
+## The fixes (patches/)
+
+Against `ace-step/ACE-Step-1.5` at `ca1e85f`; apply with `git am patches/*.patch`.
+
+1. `0001` -- honour `ACESTEP_DTYPE=float32|float16|bfloat16` on CUDA (`_resolve_cuda_dtype()`, 5 tests).
+2. `0002` -- keep the lyric encoder in float32 when the model runs in float16 (`_keep_lyric_encoder_in_float32()`,
+   4 tests). This is the one that makes pre-Ampere cards work at full FP16 speed.
+
+Not yet proposed upstream: tests 2-5 below come first.
+
+## Still to check
+
+2. The other model variants (XL 4B turbo / sft / base, 2B sft / base) -- each has its own lyric encoder.
+3. The full pipeline with the 5 Hz LM on the `pt` backend (nano-vllm / vLLM don't support sm_70).
+4. The audio decoder (VAE) in FP16 -- the "silent output" reports; this probe didn't cover it.
+5. A Pascal card (GTX 1070, sm_61), the family of the P40 / GTX 1080 reports.
+
 ## Plan
 
 1. Install exactly the official way and record what a V100 owner runs into.

@@ -1,0 +1,113 @@
+From 2afe3866543b3f11245df8a8dafe8de91ca9d80f Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 21:04:56 -0500
+Subject: [PATCH 1/2] Honour ACESTEP_DTYPE on CUDA (the setting the NaN latents
+ error already suggests)
+
+---
+ .../handler/init_service_orchestrator.py      | 33 +++++++++++++++---
+ .../generation/handler/init_service_test.py   | 34 +++++++++++++++++++
+ 2 files changed, 62 insertions(+), 5 deletions(-)
+
+diff --git a/acestep/core/generation/handler/init_service_orchestrator.py b/acestep/core/generation/handler/init_service_orchestrator.py
+index 4b03224..b37e5b9 100644
+--- a/acestep/core/generation/handler/init_service_orchestrator.py
++++ b/acestep/core/generation/handler/init_service_orchestrator.py
+@@ -42,6 +42,29 @@ def _resolve_rocm_dtype() -> torch.dtype:
+     return dtype
+ 
+ 
++def _resolve_cuda_dtype() -> torch.dtype:
++    """Return the model dtype for NVIDIA CUDA devices.
++
++    Defaults to ``bfloat16`` on cards with native bfloat16 (Ampere and newer)
++    and ``float16`` otherwise.  Set the ``ACESTEP_DTYPE`` environment variable
++    to ``float32``, ``float16`` or ``bfloat16`` to override -- e.g. ``float32``
++    on pre-Ampere cards (Volta, Turing, Pascal), where ``float16`` can
++    overflow; the NaN/Inf latents error suggests exactly this setting.
++    """
++    automatic = torch.bfloat16 if gpu_config.cuda_supports_bfloat16() else torch.float16
++    raw = os.environ.get("ACESTEP_DTYPE", "").strip().lower()
++    if not raw:
++        return automatic
++    dtype = _ROCM_DTYPE_MAP.get(raw)
++    if dtype is None:
++        logger.warning(
++            f"[initialize_service] Unknown ACESTEP_DTYPE={raw!r}; "
++            f"using the automatic choice {automatic}."
++        )
++        return automatic
++    return dtype
++
++
+ class InitServiceOrchestratorMixin:
+     """Public ``initialize_service`` orchestration entrypoint."""
+ 
+@@ -89,13 +112,13 @@ class InitServiceOrchestratorMixin:
+                     "(set ACESTEP_ROCM_DTYPE=bfloat16 or float16 to override)"
+                 )
+             elif resolved_device == "cuda":
+-                if gpu_config.cuda_supports_bfloat16():
+-                    self.dtype = torch.bfloat16
+-                else:
+-                    self.dtype = torch.float16
++                self.dtype = _resolve_cuda_dtype()
++                if os.environ.get("ACESTEP_DTYPE", "").strip():
++                    logger.info(f"[initialize_service] CUDA dtype from ACESTEP_DTYPE: {self.dtype}")
++                elif self.dtype == torch.float16:
+                     logger.info(
+                         "[initialize_service] Pre-Ampere CUDA detected: "
+-                        "using float16 instead of bfloat16."
++                        "using float16 instead of bfloat16 (set ACESTEP_DTYPE=float32 to override)."
+                     )
+             else:
+                 self.dtype = torch.bfloat16 if resolved_device == "xpu" else torch.float32
+diff --git a/acestep/core/generation/handler/init_service_test.py b/acestep/core/generation/handler/init_service_test.py
+index 7f70bda..e963796 100644
+--- a/acestep/core/generation/handler/init_service_test.py
++++ b/acestep/core/generation/handler/init_service_test.py
+@@ -884,6 +884,40 @@ class _VaeHost(_Host):
+     _get_vae_dtype = MEMORY_UTILS_MODULE.MemoryUtilsMixin._get_vae_dtype
+ 
+ 
++class CudaDtypeTests(unittest.TestCase):
++    """Tests for the CUDA dtype choice and its ACESTEP_DTYPE override (pre-Ampere cards, issue #1055)."""
++
++    def _resolve(self, env, bf16_ok):
++        with patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=bf16_ok), \
++                patch.dict("os.environ", env, clear=False):
++            if "ACESTEP_DTYPE" not in env:
++                os.environ.pop("ACESTEP_DTYPE", None)
++            return ORCHESTRATOR_MODULE._resolve_cuda_dtype()
++
++    def test_defaults_to_bfloat16_on_ampere_and_newer(self):
++        """It keeps bfloat16 when the card has native bfloat16 and nothing is set."""
++        self.assertEqual(self._resolve({}, True), torch.bfloat16)
++
++    def test_defaults_to_float16_on_pre_ampere(self):
++        """It keeps float16 on cards without native bfloat16 when nothing is set."""
++        self.assertEqual(self._resolve({}, False), torch.float16)
++
++    def test_float32_override_is_honoured(self):
++        """ACESTEP_DTYPE=float32 -- the fix the NaN error message suggests -- is actually used."""
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": "float32"}, False), torch.float32)
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": " Float32 "}, True), torch.float32)
++
++    def test_float16_and_bfloat16_overrides_are_honoured(self):
++        """The override can also pick float16 or bfloat16 explicitly."""
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": "float16"}, True), torch.float16)
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": "bfloat16"}, False), torch.bfloat16)
++
++    def test_unknown_value_falls_back_to_the_automatic_choice(self):
++        """An unrecognised ACESTEP_DTYPE is ignored with a warning."""
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": "int8"}, False), torch.float16)
++        self.assertEqual(self._resolve({"ACESTEP_DTYPE": "int8"}, True), torch.bfloat16)
++
++
+ class RocmDtypeTests(unittest.TestCase):
+     """Tests verifying safe dtype selection for ROCm/HIP devices."""
+ 
+-- 
+2.43.0
+

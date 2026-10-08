@@ -1,0 +1,147 @@
+From 3a7236115952d18e1f88dbfc9d9aae50642d1c93 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 21:14:11 -0500
+Subject: [PATCH 2/2] Keep the lyric encoder in float32 when the model runs in
+ float16 (pre-Ampere NaN latents, #1055)
+
+---
+ .../generation/handler/init_service_loader.py | 34 +++++++++
+ .../handler/lyric_encoder_precision_test.py   | 73 +++++++++++++++++++
+ 2 files changed, 107 insertions(+)
+ create mode 100644 acestep/core/generation/handler/lyric_encoder_precision_test.py
+
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 040c5ce..b02175f 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -11,6 +11,38 @@ from acestep import gpu_config
+ from .init_service_loader_components import InitServiceLoaderComponentsMixin
+ 
+ 
++
++def _keep_lyric_encoder_in_float32(model) -> bool:
++    """Run the lyric encoder in float32 when the rest of the model runs in float16.
++
++    On pre-Ampere CUDA cards (Volta, Turing, Pascal) the model runs in float16, and the lyric encoder's last layer
++    can exceed float16's range (|x| ~ 285,000 vs 65,504 on a Tesla V100 with ordinary English lyrics), turning every
++    latent into NaN -- which is why songs with lyrics failed while instrumentals worked (issue #1055).  The lyric
++    encoder runs once per generation, so keeping it in float32 costs almost nothing; its input is upcast and its
++    output cast back to the caller's dtype, and the rest of the model stays in float16.
++    Returns True if a lyric encoder was found and wrapped.
++    """
++    encoder = getattr(getattr(model, "encoder", None), "lyric_encoder", None)
++    if not isinstance(encoder, torch.nn.Module):
++        return False
++    if getattr(encoder, "_acestep_float32", False):
++        return True
++    encoder.float()
++    original_forward = encoder.forward
++
++    def forward(*args, inputs_embeds=None, **kwargs):
++        out_dtype = inputs_embeds.dtype if inputs_embeds is not None else None
++        if inputs_embeds is not None:
++            inputs_embeds = inputs_embeds.float()
++        outputs = original_forward(*args, inputs_embeds=inputs_embeds, **kwargs)
++        if out_dtype is not None and getattr(outputs, "last_hidden_state", None) is not None:
++            outputs.last_hidden_state = outputs.last_hidden_state.to(out_dtype)
++        return outputs
++
++    encoder.forward = forward
++    encoder._acestep_float32 = True
++    return True
++
+ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+     """Helpers for heavy model component loading."""
+ 
+@@ -202,6 +234,8 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+         else:
+             self.model = self.model.to("cpu").to(self.dtype)
+         self.model.eval()
++        if self.dtype == torch.float16 and _keep_lyric_encoder_in_float32(self.model):
++            logger.info("[initialize_service] float16 model: keeping the lyric encoder in float32 (it overflows float16).")
+ 
+         if compile_model:
+             self._ensure_len_for_compile(self.model, "model")
+diff --git a/acestep/core/generation/handler/lyric_encoder_precision_test.py b/acestep/core/generation/handler/lyric_encoder_precision_test.py
+new file mode 100644
+index 0000000..1bd0999
+--- /dev/null
++++ b/acestep/core/generation/handler/lyric_encoder_precision_test.py
+@@ -0,0 +1,73 @@
++"""Tests for keeping the lyric encoder in float32 when the model runs in float16 (pre-Ampere CUDA, issue #1055).
++
++On a Tesla V100 the lyric encoder's last layer (layers.7.mlp.down_proj) reaches |x| ~ 285,000 on ordinary English
++lyrics -- past float16's 65,504 -- so every latent becomes NaN; instrumentals (no lyrics) are unaffected."""
++
++import types
++import unittest
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import init_service_loader as LOADER
++
++
++class _FakeLyricEncoder(nn.Module):
++    """Doubles its input with a float32-sensitive layer and records the dtype it computed in."""
++
++    def __init__(self):
++        super().__init__()
++        self.proj = nn.Linear(4, 4, bias=False)
++        nn.init.eye_(self.proj.weight)
++        self.seen = None
++
++    def forward(self, inputs_embeds=None, attention_mask=None):
++        self.seen = inputs_embeds.dtype
++        h = self.proj(inputs_embeds) * 40000.0  # would overflow float16 (> 65,504) for inputs >= 2
++        h = h / 40000.0
++        return types.SimpleNamespace(last_hidden_state=h)
++
++
++class _FakeModel(nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.encoder = nn.Module()
++        self.encoder.lyric_encoder = _FakeLyricEncoder()
++        self.decoder = nn.Linear(4, 4)
++
++
++class KeepLyricEncoderFloat32Tests(unittest.TestCase):
++    def test_lyric_encoder_runs_in_float32_and_returns_the_model_dtype(self):
++        model = _FakeModel().half()
++        self.assertTrue(LOADER._keep_lyric_encoder_in_float32(model))
++        enc = model.encoder.lyric_encoder
++        self.assertEqual(enc.proj.weight.dtype, torch.float32)
++        self.assertEqual(model.decoder.weight.dtype, torch.float16)   # the rest stays float16
++        x = torch.full((1, 3, 4), 2.0, dtype=torch.float16)
++        out = enc(inputs_embeds=x, attention_mask=None).last_hidden_state
++        self.assertEqual(enc.seen, torch.float32)
++        self.assertEqual(out.dtype, torch.float16)
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertTrue(torch.allclose(out.float(), torch.full((1, 3, 4), 2.0)))
++
++    def test_without_the_fix_the_same_input_overflows(self):
++        """Control: the fake encoder really does overflow in float16, so the test above can fail."""
++        enc = _FakeModel().half().encoder.lyric_encoder
++        out = enc(inputs_embeds=torch.full((1, 3, 4), 2.0, dtype=torch.float16)).last_hidden_state
++        self.assertFalse(torch.isfinite(out).all())
++
++    def test_models_without_a_lyric_encoder_are_left_alone(self):
++        model = nn.Linear(4, 4).half()
++        self.assertFalse(LOADER._keep_lyric_encoder_in_float32(model))
++        self.assertEqual(model.weight.dtype, torch.float16)
++
++    def test_applying_twice_does_not_wrap_twice(self):
++        model = _FakeModel().half()
++        LOADER._keep_lyric_encoder_in_float32(model)
++        fwd = model.encoder.lyric_encoder.forward
++        LOADER._keep_lyric_encoder_in_float32(model)
++        self.assertIs(model.encoder.lyric_encoder.forward, fwd)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
