@@ -1,132 +1,138 @@
-# ACE-Step 1.5 on a Tesla V100 (Volta, sm_70)
+# ACE-Step 1.5 on a Tesla V100 (and other cards without BF16)
 
-**Status: in progress (started 2026-10-07).** Root cause found and fixed locally; more checks before proposing it upstream.
+**Status (2026-10-08): every model works in FP16 on the V100 -- 48 of 48 songs -- and on a GTX 1070.** Not yet
+proposed upstream.
 
 [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) makes full songs with vocals from lyrics and a style
-description. On cards without BF16 hardware (Volta, Turing, Pascal) people report:
-
-- songs **with lyrics** fail with "NaN or Inf latents" in FP16, while instrumentals work;
-- the audio decoder outputs **silence** in FP16;
-- the error message suggests `ACESTEP_DTYPE=float32`, a setting the code doesn't read.
-
-Reports: [#1055](https://github.com/ace-step/ACE-Step-1.5/issues/1055) (P40, GTX 1080, Titan Xp),
+description. On cards without BF16 hardware (Volta, Turing, Pascal) it falls back to FP16, and people report songs
+**with lyrics** failing with "NaN or Inf latents" while instrumentals work, silent output, and an error message that
+suggests `ACESTEP_DTYPE=float32` -- a setting the code doesn't read. Reports:
+[#1055](https://github.com/ace-step/ACE-Step-1.5/issues/1055) (P40, GTX 1080, Titan Xp),
 [#1243](https://github.com/ace-step/ACE-Step-1.5/issues/1243) (T4),
 [#1274](https://github.com/ace-step/ACE-Step-1.5/issues/1274) (Pascal / Turing),
 [#927](https://github.com/ace-step/ACE-Step-1.5/issues/927) (T4) -- all closed as stale, none fixed.
 
-## First results (2026-10-07)
+## Result
 
-One fixed request: 30 s, English lyrics, `acestep-v15-turbo`, 8 steps, seed 1234, song model only (no LM), installed
-the official way (`uv sync`: torch 2.10.0+cu128 -- which still includes sm_70).
+Same 8 shipped example songs (`examples/text2music/example_NN.json`: 5 languages, 2:22-3:56 long, as shipped) on
+every model, seed 1234, song model only, ACE-Step at `ca1e85f`.
 
-| card | dtype | result | time for 30 s of song |
-| :--- | :--- | :--- | ---: |
-| RTX 4070 | bfloat16 (automatic) | song, 0 NaN, peak 0.89, RMS 0.168 | 1.8 s |
-| Tesla V100 | float16 (automatic) | **fails: all 48,000 latents NaN** ("Generation produced NaN or Inf latents") | -- |
-| Tesla V100 | float32 (`ACESTEP_DTYPE=float32`, with fix 1) | song, 0 NaN, peak 0.89, RMS 0.140 | 2.6 s |
-| **Tesla V100** | **float16 + lyric encoder in float32 (fix 2)** | **song, 0 NaN, peak 0.89, RMS 0.132** | **1.4 s** |
+| model | steps / CFG | stock, V100 FP16 | all fixes, V100 FP16 | 3:48 song, V100 FP16 | same, V100 FP32 | same, RTX 4070 BF16 |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: |
+| turbo (2B) | 8 / none | fails | **8/8 songs** | **5.7 s** | 11.4 s | 6.7 s |
+| sft (2B) | 50 / 7.0 | fails | **8/8** | 42.5 s | -- | 36.9 s |
+| base (2B) | 50 / 7.0 | fails | **8/8** | 42.5 s | -- | -- |
+| xl-turbo (4B) | 8 / none | fails | **8/8** | 10.8 s | 26.4 s | -- |
+| xl-sft (4B) | 50 / 7.0 | fails | **8/8** | 104.4 s | -- | -- |
+| xl-base (4B) | 50 / 7.0 | fails | **8/8** | 104.4 s | -- | -- |
 
-- The bug is still there in today's code (`ca1e85f`), even with ACE-Step's own pre-Ampere workaround (eager
-  attention "for float16 numerical stability").
-- **`ACESTEP_DTYPE` does nothing upstream:** it appears once in the code -- inside the error message that tells you to
-  set it. AMD cards already have the equivalent (`ACESTEP_ROCM_DTYPE`); NVIDIA cards never got one.
-- **Fix 1 (done, local branch `volta/cuda-dtype-override`, 2afe386):** `_resolve_cuda_dtype()` honours
-  `ACESTEP_DTYPE=float32|float16|bfloat16`, modelled on the ROCm override, with 5 unit tests (fail before, pass
-  after). The one other failure in `init_service_test.py` (`test_load_main_model_ignores_cuda_sync_cleanup_error`)
-  fails the same way on unpatched `main`.
-- **Root cause (probe on all 1,466 layers, `work/probe.py`):** in an FP32 run exactly one layer exceeds FP16's
-  65,504 -- `model.encoder.lyric_encoder.layers.7.mlp.down_proj`, max |x| = **285,393** (4.4x the limit). Next
-  largest: `model.decoder.layers.23` at 29,738. In the FP16 run the first non-finite output is that same
-  `down_proj`. The lyric encoder only matters when there are lyrics -- hence "lyrics fail, instrumentals work".
-- **Fix 2 (local branch, after fix 1):** `_keep_lyric_encoder_in_float32(model)` in `init_service_loader.py` --
-  when the model loads in FP16, the lyric encoder alone is kept in FP32 (input upcast, output cast back); it runs
-  once per song, so it costs nothing measurable. 4 unit tests, including a control that proves the fake encoder
-  overflows without the fix. **Result: the V100 makes the song in FP16 in 1.4 s** (FP32: 2.6 s; RTX 4070 BF16: 1.8 s).
-- Similarity (same seed): waveforms of generated music don't line up across precisions (4070 vs V100 FP32 correlate
-  at -0.04 too), so the check is by ear plus spectrum similarity: FP16-fix vs FP32 0.85, 4070 vs FP32 0.90.
+"Fails" = every song with lyrics comes out NaN: each model's own lyric encoder peaks at 499,000-505,000 in the final
+run (`data/final-*.json`, `lyric_max`), and a stock FP16 lyric encoder gives NaN on all 8 songs (`scripts/probe_lyric2.py`,
+2B and XL). Stock turbo also failed end to end (test 1), and the CFG and XL models fail in the decoder as well. Timings: one clean run without hooks, the second (warm) of two, example
+song 10 (3:48, English), `scripts/timing.py`. 48/48: zero NaN samples, RMS 0.07-0.28.
 
-## Test 1: eight full-length songs (2026-10-07)
+- **FP16 is what makes the V100 worth it:** 2.0-2.4x faster than FP32 and about half the memory (turbo 7.3 vs 13.0 GB,
+  xl-turbo 13.1 vs 23.9 GB). With it the V100 makes a 3:48 song in 5.7 s -- a bit faster than an RTX 4070 in BF16
+  (6.7 s); the 4070 is ahead on the 50-step CFG models (36.9 vs 42.5 s).
+- The XL models fit easily: 15.3 GB peak for xl-sft/base.
 
-ACE-Step's own `examples/text2music/example_NN.json` (caption, lyrics, BPM, key, length as shipped), V100, FP16 with
-fix 2, seed 1234, a hook on every layer. Max |value| per part; FP16's limit is 65,504.
+**GTX 1070 (Pascal, 8 GB):** stock FP16 also gives all-NaN latents; with the fixes a 30-s song takes 15.4 s
+(CPU offload on, ~6 GB free). See [Pascal](#pascal-gtx-1070-sm_61).
 
-| # | language | length | lyrics chars | result | lyric encoder max | decoder max (layer) | time* |
-| ---: | :--- | ---: | ---: | :--- | ---: | ---: | ---: |
-| 01 | zh | 160 s | 460 | song, 0 NaN | 501,389 | 26,016 (layers.23) | 15.9 s |
-| 02 | es | 159 s | 1450 | song, 0 NaN | 449,292 | 23,952 (layers.14) | 16.1 s |
-| 03 | fr | 142 s | 2729 | song, 0 NaN | 480,436 | 24,000 (layers.23) | 15.4 s |
-| 05 | ja | 200 s | 1549 | song, 0 NaN | 444,358 | 26,560 (layers.20) | 20.7 s |
-| 10 | en | 228 s | 1184 | song, 0 NaN | 504,648 | 25,408 (layers.23) | 23.5 s |
-| 113 | zh | 220 s | 243 | song, 0 NaN | 423,573 | 23,440 (layers.23) | 22.1 s |
-| 118 | zh | 178 s | 210 | song, 0 NaN | 415,467 | 28,064 (layers.23) | 17.9 s |
-| 108 | zh | 236 s | 133 | song, 0 NaN | 267,289 | 23,264 (layers.14) | 23.8 s |
+## What overflows, and the fix for each
 
-\*with all 1,466 hooks attached, which slows it down; not a speed figure.
+FP16's largest number is 65,504. Measured in FP32 with a hook on every layer:
 
-- **All eight make songs.** Without fix 2 every one would fail: the lyric encoder reaches 267,000-505,000 on all of
-  them -- even #108, an instrumental whose "lyrics" are only section tags.
-- **The decoder never comes near the limit:** 23,264-28,064 across languages, styles and lengths up to 3:56, the same
-  range as the 30-s song (29,738). Longer songs do not push it higher.
-- The VAE hooks recorded nothing (max 0) -- the decoder-to-audio step isn't covered by this probe yet; the audio
-  itself is fine (RMS 0.12-0.18, no NaN).
+| where | FP32 peak | models | fix |
+| :--- | ---: | :--- | :--- |
+| lyric encoder, `layers[-1].mlp.down_proj` | ~505,000 | all six | compute that one projection in FP32 (`0006`) |
+| DiT residual stream (`decoder.layers.N` output) | 175K (sft), 531K (xl-turbo), 789K (xl-base), 1.36M (xl-sft) | all but 2B turbo | scale the stream by 1/64, exactly (`0004` + `0007`) |
+| XL self-attention scores, `decoder.layers.0` | up to ~128,000 before scaling | the three XL | fold the 1/sqrt(d) scale into `q_norm` (`0005`) |
 
-## The fixes (patches/)
+1. **Lyric encoder.** Its last MLP output reaches ~505,000 while everything before it stays under ~11,500, and the
+   stream goes straight into the final norm after it. Only that projection is computed in FP32, from its own FP16
+   weights upcast on the fly (a 3072x1024 matrix); the residual add promotes to FP32 and the final norm's output is
+   cast back. Relative error vs a fully-FP32 encoder: 0.2-7% (2B), 0.2-2.4% (XL). This is why "lyrics fail,
+   instrumentals work": the lyric encoder only matters when there are lyrics. (Even #108, whose "lyrics" are only
+   section tags, reaches 267,000.)
+2. **DiT residual stream.** Each layer adds gated branch outputs to the stream; with CFG the gated MLP output alone
+   reaches 137,000 (2B sft, layer 20), and the XL stream reaches 1.36 million (xl-sft, layer 18). Every branch reads
+   the stream through an RMSNorm, which ignores overall scale, and the stream ends in `norm_out`; so `proj_in` and
+   every `o_proj` / `down_proj` are divided by 64 at load time, and those norms' epsilon by 64^2. That is exact --
+   same output, zero run-time cost -- and leaves ~3x headroom on the worst case (xl-sft: 21,328 after scaling).
+3. **XL attention.** The XL checkpoints' layer-0 `q_norm` and `k_norm` weights reach ~31.6 each (the 2B models'
+   worst product is 9.8, the XL's 1,000.7), so one q.k over 128 dims can reach ~128,000. Eager attention -- which
+   ACE-Step forces on pre-Ampere cards "for float16 numerical stability" -- computes `matmul(q, k^T)` in FP16 and
+   only then multiplies by `1/sqrt(128)`. Multiplying `q_norm.weight` by that scale and setting `scaling = 1.0`
+   gives the same scores, already scaled, straight out of the matmul (RoPE is a rotation, so it commutes).
 
-Against `ace-step/ACE-Step-1.5` at `ca1e85f`; apply with `git am patches/*.patch`.
+## The patches (`patches/`)
 
-1. `0001` -- honour `ACESTEP_DTYPE=float32|float16|bfloat16` on CUDA (`_resolve_cuda_dtype()`, 5 tests).
-2. `0002` -- keep the lyric encoder in float32 when the model runs in float16 (`_keep_lyric_encoder_in_float32()`,
-   4 tests). This is the one that makes pre-Ampere cards work at full FP16 speed.
+Against `ace-step/ACE-Step-1.5` at `ca1e85f`; apply with `git am patches/*.patch`. Each has unit tests that fail
+before and pass after, including a control proving the overflow is real (`attention_scale_fold_test.py`,
+`dit_stream_scale_test.py`, `lyric_encoder_precision_test.py`, `CudaDtypeTests`); the one other failure in
+`init_service_test.py` (`test_load_main_model_ignores_cuda_sync_cleanup_error`) fails the same way on unpatched `main`.
 
-3. `0003` -- a comment on why the wrapper only upcasts `inputs_embeds` (`AceStepLyricEncoder.forward` asserts
-   `input_ids is None`; the integer attention mask passes through).
+| patch | what | status |
+| :--- | :--- | :--- |
+| `0001` | honour `ACESTEP_DTYPE=float32\|float16\|bfloat16` on CUDA (`_resolve_cuda_dtype()`, modelled on `ACESTEP_ROCM_DTYPE`) | keep |
+| `0002`, `0003` | the whole lyric encoder in FP32 (+ a comment) | **superseded by `0006`**: +0.9 GB VRAM (OOM on the 8 GB GTX 1070), and CPU offload's `model.to(dtype=float16)` undid it ("mat1 and mat2 must have the same dtype") |
+| `0004` | DiT residual stream / 8 | factor and epsilon updated by `0007` |
+| `0005` | XL attention: scale folded into `q_norm` | keep |
+| `0006` | only the lyric encoder's last projection in FP32 | keep |
+| `0007` | stream / 64, norms' epsilon / 64^2 (/8 left xl-turbo within 1% of the limit and xl-sft overflowing) | keep |
 
-4. `0004` -- scale the DiT decoder's residual stream by 1/8 in float16 (`_rescale_dit_residual_stream()`, 4 tests,
-   including one that checks the output is unchanged). Needed for the CFG models (sft/base): see below.
+For the upstream PR these collapse to four changes: `0001`, `0006`, `0004`+`0007`, `0005`.
 
-Not yet proposed upstream: tests 2-5 below come first.
+### Open question for the maintainers: loader-side or model-side?
 
-### Second overflow: the CFG models (found in test 2)
+All three numeric fixes run in the loader (`init_service_loader.py`) after `from_pretrained` and the
+`.to(device).to(self.dtype)`, so they cover all six model variants from one place. The model-side alternative --
+doing the same inside `AceStepLyricEncoder`, `AceStepAttention` and the DiT -- is more conventional, but those
+classes are duplicated in six model files (`base`, `sft`, `turbo`, `xl_base`, `xl_sft`, `xl_turbo`) and the
+checkpoints carry their own copy of the modeling code. We'll offer both and follow the maintainers' preference.
 
-The `acestep-v15-sft` model (50 steps, CFG 7.0) still failed in FP16 with fix 2: 3 of 3 songs gave all-NaN latents,
-first non-finite output in `model.decoder.layers.20`. An FP32 probe (`scripts/probe2.py`) shows the decoder's layer-20
-output reaching **136,973** (2.1x FP16's limit) while every branch inside it stays under 16,000 -- the spike is the
-MLP output times its timestep gate (`ff_output * c_gate_msa`), and the stream comes back down in layers 21-23
-(24K, 19K). Turbo models (no CFG, 8 steps) peak at ~28K, which is why test 1 never hit it.
+## Other findings
 
-Every branch reads the stream through an RMSNorm, which ignores scale, and the stream ends in `norm_out`; so fix 3
-divides `proj_in` and every `o_proj` / `down_proj` by 8 at load time: exact in FP16, zero run-time cost, same output.
-With it, sft makes all three failed songs (layer-20 peak 21-22K).
+- **The 5 Hz LM (planner) works on the V100 with both backends.** The default `vllm` backend (bundled nano-vllm)
+  detects Volta, switches itself to FP16 and runs eager: 1.7B LM + turbo, a 3:48 song in 38 s, of which the LM is
+  31 s. The `pt` backend: 3/3 songs, LM 110-126 s each. (An earlier version of this page said nano-vllm doesn't
+  support sm_70; it does.)
+- **The audio decoder (VAE) is fine in FP16:** no NaN, no silence, RMS 0.150 vs 0.147 forced-FP32 on the same song.
+  The "silent output" reports are most likely the NaN latents above, decoded.
+- **`ACESTEP_DTYPE` does nothing upstream:** it appears once in the code -- inside the error message telling you to
+  set it.
+- **Turing** (RTX 20-series, T4) has no BF16 either and takes the same FP16 path; not tested here.
 
-### Open question for the maintainers: loader-side wrapper or model-side dtype handling?
+### Pascal (GTX 1070, sm_61)
 
-Fix 2 wraps `lyric_encoder.forward` in the loader. The model-side alternative is Transformers' own hook,
-`_keep_in_fp32_modules = ["lyric_encoder"]` on `AceStepPreTrainedModel`, plus an upcast in
-`AceStepLyricEncoder.forward` and a cast back in `AceStepConditionEncoder`. Trade-offs:
+- The official install (`uv sync`, torch 2.10.0+cu128) has no Pascal kernels: "CUDA error: no kernel image is
+  available for execution on the device". The same version from the cu126 index has them (sm_50 ... sm_90); see
+  [ENVIRONMENT.md](ENVIRONMENT.md) for the one-line reinstall (and why the obvious one silently does nothing).
+- With cu126 torch, stock code: all-NaN latents, as on the V100.
+- With the fixes (`0001`-`0006`), 30-s song: **15.4 s** (CPU offload, default), 20.0 s (DiT offloaded too). Both
+  settings failed with `0002` (OOM, then the dtype error above). Same-seed similarity to the V100 and 4070 renders
+  (log-mel correlation 0.58-0.74) is in the same range as two 1070 renders with different offload settings (0.58).
 
-- **Model-side** is the more idiomatic Transformers pattern, but the lyric encoder is duplicated in **six** model
-  files (`base`, `sft`, `turbo`, `xl_base`, `xl_sft`, `xl_turbo`), and the loader's `self.model.to(device).to(self.dtype)`
-  right after `from_pretrained` would cast the module back to float16 anyway -- so it needs a loader change too.
-- **Loader-side** (this patch) is one place, covers every variant, and runs after that `.to(dtype)`.
+## Measurement notes
 
-We'll offer both in the PR and follow the maintainers' preference.
+Two of tonight's surprises were the instrument, not the model:
 
-## Still to check
+- The per-layer hooks found each output's max with `a[torch.isfinite(a)]`, which copies the tensor -- including eager
+  attention's weights (batch x heads x L x L). While those were NaN the copy was tiny; once fix `0005` made them
+  finite, a 4-minute CFG song asked for 15.5 GB and ran the V100 out of memory. Hooks now skip 4-D tensors.
+- `uv pip install torch==2.10.0 --index-url .../cu126` over an installed 2.10.0+cu128 reports "Checked 3 packages"
+  and changes nothing.
 
-2. The other model variants (XL 4B turbo / sft / base, 2B sft / base) -- each has its own lyric encoder.
-3. The full pipeline with the 5 Hz LM on the `pt` backend (nano-vllm / vLLM don't support sm_70).
-4. The audio decoder (VAE) in FP16 -- the "silent output" reports; this probe didn't cover it.
-5. A Pascal card (GTX 1070, sm_61), the family of the P40 / GTX 1080 reports.
+## Layout
 
-## Plan
+- `patches/` -- the fixes, as above.
+- `scripts/` -- `repro.py` (one 30-s song), `probe.py` / `probe2.py` (hook every layer), `probe_batch.py` (the 8
+  songs), `probe_lyric2.py` (lyric encoder alone, FP32 vs FP16 variants), `test3.py` (LM backends), `test4.py` (VAE),
+  `timing.py` (clean speed), `test5*.sh` (GTX 1070).
+- `data/` -- per-song results.
+- [ENVIRONMENT.md](ENVIRONMENT.md) -- the two machines.
 
-1. Install exactly the official way and record what a V100 owner runs into.
-2. Reproduce the failures on the V100; run the same songs on the RTX 4070 (BF16 hardware) as the reference.
-3. Find the layer(s) that overflow in FP16, compare against the 4070, fix only those.
-4. Prove it with songs (before: NaN / silence, after: music), speed and quality numbers.
-5. Propose the fix upstream following ACE-Step's CONTRIBUTING.md (AI-assisted rules).
+## Next
 
-Also on Volta: the default LM backend uses vLLM (nano-vllm), which does not support sm_70; the `pt` backend
-is the fallback.
-
-See [ENVIRONMENT.md](ENVIRONMENT.md) for the machine.
+1. The upstream PR, following ACE-Step's CONTRIBUTING.md (AI-assisted rules).

@@ -1,0 +1,150 @@
+From 22cc4ab44fb4b95b0d0d186530aef5f8a5b14609 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:21:48 -0500
+Subject: [PATCH] Fold the attention score scale into q_norm in float16 (XL
+ models overflow in eager attention)
+
+The XL checkpoints' decoder.layers.0 q_norm/k_norm weights reach ~31.6 each, so eager attention's unscaled
+matmul(q, k^T) can reach ~128,000 -- past float16's 65,504 -- and every latent turns NaN on pre-Ampere GPUs.
+Multiplying q_norm.weight by 1/sqrt(head_dim) and setting scaling to 1.0 gives the same scores, already scaled,
+straight out of the matmul (RoPE is a rotation, so it commutes). No runtime cost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../handler/attention_scale_fold_test.py      | 77 +++++++++++++++++++
+ .../generation/handler/init_service_loader.py | 27 +++++++
+ 2 files changed, 104 insertions(+)
+ create mode 100644 acestep/core/generation/handler/attention_scale_fold_test.py
+
+diff --git a/acestep/core/generation/handler/attention_scale_fold_test.py b/acestep/core/generation/handler/attention_scale_fold_test.py
+new file mode 100644
+index 0000000..35e77f5
+--- /dev/null
++++ b/acestep/core/generation/handler/attention_scale_fold_test.py
+@@ -0,0 +1,77 @@
++"""Tests for folding the attention score scale into q_norm when the model runs in float16 (pre-Ampere CUDA).
++
++The XL checkpoints' decoder.layers.0 q_norm/k_norm weights reach ~31.6 each, so eager attention's unscaled
++matmul(q, k^T) can reach ~128,000 -- past float16's 65,504 -- and every latent turns NaN on a V100. These tests use
++the real XL AceStepAttention and transformers' eager attention."""
++
++import unittest
++
++import torch
++from torch import nn
++
++from acestep.core.generation.handler import init_service_loader as LOADER
++from acestep.models.common.configuration_acestep_v15 import AceStepConfig
++from acestep.models.xl_turbo.modeling_acestep_v15_xl_turbo import AceStepAttention
++
++
++def _attention(norm_weight=1.0):
++    config = AceStepConfig(hidden_size=128, num_attention_heads=1, num_key_value_heads=1, head_dim=128,
++                           layer_types=["full_attention"], attention_bias=False)
++    config._attn_implementation = "eager"
++    torch.manual_seed(0)
++    attn = AceStepAttention(config, layer_idx=0, is_cross_attention=False)
++    with torch.no_grad():
++        attn.q_proj.weight.copy_(torch.eye(128)); attn.k_proj.weight.copy_(torch.eye(128))
++        attn.q_norm.weight.fill_(norm_weight); attn.k_norm.weight.fill_(norm_weight)
++    return attn
++
++
++class _Holder(nn.Module):
++    def __init__(self, attn):
++        super().__init__(); self.attn = attn
++
++
++def _run(attn, x):
++    return attn(x, attention_mask=None)[0]
++
++
++class FoldAttentionScaleTests(unittest.TestCase):
++    def setUp(self):
++        # Two identical tokens: q.k = 128 * w^2 with RMS-normalised q and k.
++        self.x = torch.ones(1, 2, 128)
++
++    def test_output_is_unchanged(self):
++        attn = _attention(norm_weight=3.0)
++        x = torch.randn(1, 6, 128)
++        before = _run(attn, x)
++        self.assertEqual(LOADER._fold_attention_scale_into_query_norm(_Holder(attn)), 1)
++        self.assertEqual(attn.scaling, 1.0)
++        self.assertTrue(torch.allclose(before, _run(attn, x), rtol=1e-4, atol=1e-5))
++
++    def test_float16_overflow_goes_away(self):
++        """Control + fix: w=31.6 (the XL layer-0 value) overflows float16 unfolded and stays finite once folded."""
++        attn = _attention(norm_weight=31.6).half()
++        x = self.x.half()
++        reference = _run(_attention(norm_weight=31.6), self.x)
++        self.assertFalse(torch.isfinite(_run(attn, x)).all())
++        LOADER._fold_attention_scale_into_query_norm(_Holder(attn))
++        out = _run(attn, x)
++        self.assertTrue(torch.isfinite(out).all())
++        self.assertTrue(torch.allclose(out.float(), reference, rtol=1e-2, atol=1e-2))
++
++    def test_applying_twice_does_not_fold_twice(self):
++        attn = _attention(norm_weight=3.0)
++        LOADER._fold_attention_scale_into_query_norm(_Holder(attn))
++        w = attn.q_norm.weight.clone()
++        self.assertEqual(LOADER._fold_attention_scale_into_query_norm(_Holder(attn)), 0)
++        self.assertTrue(torch.equal(w, attn.q_norm.weight))
++
++    def test_modules_without_q_norm_are_left_alone(self):
++        lora_like = nn.Linear(4, 4); lora_like.scaling = {"default": 2.0}
++        plain = nn.Linear(4, 4); plain.scaling = 0.5
++        self.assertEqual(LOADER._fold_attention_scale_into_query_norm(nn.ModuleList([lora_like, plain])), 0)
++        self.assertEqual(plain.scaling, 0.5)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 0d3540c..f00a625 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -44,6 +44,29 @@ def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
+     decoder._acestep_stream_scale = factor
+     return True
+ 
++def _fold_attention_scale_into_query_norm(model) -> int:
++    """Fold each attention layer's 1/sqrt(head_dim) score scale into its q_norm weight.
++
++    Eager attention computes matmul(q, k^T) in the model dtype and only then multiplies by ``scaling``. In the XL
++    checkpoints decoder.layers.0's q_norm and k_norm weights reach ~31.6 each, so one q.k over 128 dims can reach
++    ~128,000 -- past float16's 65,504 -- and the softmax turns every latent NaN. Scaling q by ``scaling`` (before
++    RoPE, which is a rotation and commutes with it) and setting ``scaling`` to 1.0 gives the same scores, already
++    scaled, straight out of the matmul. Returns how many attention layers were changed.
++    """
++    folded = 0
++    for module in model.modules():
++        weight = getattr(getattr(module, "q_norm", None), "weight", None)
++        scaling = getattr(module, "scaling", None)
++        # LoRA layers also have a `scaling` (a dict), but no q_norm; skip anything already folded.
++        if not isinstance(weight, torch.nn.Parameter) or not isinstance(scaling, float) or scaling == 1.0:
++            continue
++        with torch.no_grad():
++            weight.mul_(scaling)
++        module.scaling = 1.0
++        folded += 1
++    return folded
++
++
+ def _keep_lyric_encoder_in_float32(model) -> bool:
+     """Run the lyric encoder in float32 when the rest of the model runs in float16.
+ 
+@@ -272,6 +295,10 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+             logger.info("[initialize_service] float16 model: keeping the lyric encoder in float32 (it overflows float16).")
+         if self.dtype == torch.float16 and _rescale_dit_residual_stream(self.model):
+             logger.info("[initialize_service] float16 model: DiT residual stream scaled by 1/8 to stay in float16 range.")
++        if self.dtype == torch.float16:
++            folded = _fold_attention_scale_into_query_norm(self.model)
++            if folded:
++                logger.info(f"[initialize_service] float16 model: attention score scale folded into q_norm ({folded} layers).")
+ 
+         if compile_model:
+             self._ensure_len_for_compile(self.model, "model")
+-- 
+2.43.0
+

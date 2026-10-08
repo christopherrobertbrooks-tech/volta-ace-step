@@ -1,0 +1,122 @@
+From e95d79b07e639b6d9ca4206b016683947020c561 Mon Sep 17 00:00:00 2001
+From: christopherrobertbrooks-tech
+ <289533927+christopherrobertbrooks-tech@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:16:28 -0500
+Subject: [PATCH] Scale the DiT stream by 1/64 and the norms' epsilon by 1/64^2
+ (XL models need the larger factor)
+
+With 1/8 the XL decoder's stream still reached 59,000-65,000 at layers.18 on xl-turbo (within 1% of float16's
+65,504) and overflowed at layers.10 on xl-sft (CFG). Dividing each stream-reading RMSNorm's variance_epsilon by
+factor**2 makes the rescale exact even where epsilon matters, so the larger factor costs nothing; q_norm/k_norm,
+which read q and k rather than the stream, are left alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../handler/dit_stream_scale_test.py          | 30 +++++++++++++++++--
+ .../generation/handler/init_service_loader.py | 11 +++++--
+ 2 files changed, 37 insertions(+), 4 deletions(-)
+
+diff --git a/acestep/core/generation/handler/dit_stream_scale_test.py b/acestep/core/generation/handler/dit_stream_scale_test.py
+index d870cfd..1e54ed5 100644
+--- a/acestep/core/generation/handler/dit_stream_scale_test.py
++++ b/acestep/core/generation/handler/dit_stream_scale_test.py
+@@ -14,10 +14,12 @@ from acestep.core.generation.handler import init_service_loader as LOADER
+ 
+ 
+ class _RMSNorm(nn.Module):
++    """Same arithmetic and attribute name as Qwen3RMSNorm."""
+     def __init__(self, d, eps=1e-6):
+-        super().__init__(); self.w = nn.Parameter(torch.ones(d)); self.eps = eps
++        super().__init__(); self.weight = nn.Parameter(torch.ones(d)); self.variance_epsilon = eps
+     def forward(self, x):
+-        return self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
++        h = x.float()
++        return self.weight * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)).to(x.dtype)
+ 
+ 
+ class _Attn(nn.Module):
+@@ -89,6 +91,30 @@ class RescaleDitResidualStreamTests(unittest.TestCase):
+         LOADER._rescale_dit_residual_stream(model, factor=64.0)
+         self.assertTrue(torch.isfinite(model.decoder(x)).all())
+ 
++    def test_a_small_stream_is_unchanged_too(self):
++        """With a stream small enough for the norms' epsilon to matter, the epsilon must be scaled with it."""
++        model = _Model(gate=1.0)
++        x = self.x * 2e-5
++        before = model.decoder(x)
++        LOADER._rescale_dit_residual_stream(model, factor=64.0)
++        self.assertTrue(torch.allclose(before, model.decoder(x), rtol=1e-4, atol=1e-4))
++
++    def test_without_the_epsilon_change_a_small_stream_would_change(self):
++        """Control for the test above: rescaling the weights alone does change this output."""
++        model = _Model(gate=1.0)
++        x = self.x * 2e-5
++        before = model.decoder(x)
++        LOADER._rescale_dit_residual_stream(model, factor=64.0)
++        for m in model.modules():
++            if isinstance(m, _RMSNorm): m.variance_epsilon = 1e-6
++        self.assertFalse(torch.allclose(before, model.decoder(x), rtol=1e-4, atol=1e-4))
++
++    def test_attention_q_k_norms_are_not_touched(self):
++        model = _Model()
++        qn = _RMSNorm(4); model.decoder.layers[0].self_attn.q_norm = qn
++        LOADER._rescale_dit_residual_stream(model, factor=64.0)
++        self.assertEqual(qn.variance_epsilon, 1e-6)
++
+     def test_applying_twice_does_not_scale_twice(self):
+         model = _Model()
+         LOADER._rescale_dit_residual_stream(model, factor=8.0)
+diff --git a/acestep/core/generation/handler/init_service_loader.py b/acestep/core/generation/handler/init_service_loader.py
+index 8faf2b9..cd9014a 100644
+--- a/acestep/core/generation/handler/init_service_loader.py
++++ b/acestep/core/generation/handler/init_service_loader.py
+@@ -12,7 +12,7 @@ from .init_service_loader_components import InitServiceLoaderComponentsMixin
+ 
+ 
+ 
+-def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
++def _rescale_dit_residual_stream(model, factor: float = 64.0) -> bool:
+     """Keep the DiT decoder's residual stream inside float16's range by scaling it down by ``factor``.
+ 
+     With the CFG models (sft/base) the gated MLP output of a decoder layer can exceed float16's 65,504 (|x| ~ 137,000
+@@ -20,6 +20,8 @@ def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
+     stream through an RMSNorm, which ignores its overall scale, and the stream ends in ``norm_out``; so dividing the
+     stream's input (``proj_in``) and every branch output (``o_proj`` of self/cross attention, the MLP's ``down_proj``)
+     by the same power of two leaves the generated audio unchanged, costs nothing at run time, and is exact in float16.
++    The norms' epsilon is divided by ``factor**2`` too, so even a stream small enough for epsilon to matter is unchanged.
++    The XL models need the larger factor: their stream reaches ~519,000 (turbo) and more with CFG (sft/base).
+     Returns True if the decoder has that shape and was rescaled (once).
+     """
+     decoder = getattr(model, "decoder", None)
+@@ -30,7 +32,9 @@ def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
+     if getattr(decoder, "_acestep_stream_scale", None):
+         return True
+     targets = [m for m in proj_in.modules() if isinstance(m, (torch.nn.Linear, torch.nn.Conv1d))]
++    norms = [decoder.norm_out]
+     for layer in layers:
++        norms += [getattr(layer, name, None) for name in ("self_attn_norm", "cross_attn_norm", "mlp_norm")]
+         for branch in (getattr(getattr(layer, "self_attn", None), "o_proj", None),
+                        getattr(getattr(layer, "cross_attn", None), "o_proj", None),
+                        getattr(getattr(layer, "mlp", None), "down_proj", None)):
+@@ -41,6 +45,9 @@ def _rescale_dit_residual_stream(model, factor: float = 8.0) -> bool:
+             module.weight.div_(factor)
+             if module.bias is not None:
+                 module.bias.div_(factor)
++    for norm in norms:
++        if isinstance(getattr(norm, "variance_epsilon", None), float):
++            norm.variance_epsilon /= factor * factor
+     decoder._acestep_stream_scale = factor
+     return True
+ 
+@@ -294,7 +301,7 @@ class InitServiceLoaderMixin(InitServiceLoaderComponentsMixin):
+         if self.dtype == torch.float16 and _compute_lyric_encoder_tail_in_float32(self.model):
+             logger.info("[initialize_service] float16 model: lyric encoder's last projection computed in float32 (it overflows float16).")
+         if self.dtype == torch.float16 and _rescale_dit_residual_stream(self.model):
+-            logger.info("[initialize_service] float16 model: DiT residual stream scaled by 1/8 to stay in float16 range.")
++            logger.info("[initialize_service] float16 model: DiT residual stream scaled by 1/64 to stay in float16 range.")
+         if self.dtype == torch.float16:
+             folded = _fold_attention_scale_into_query_norm(self.model)
+             if folded:
+-- 
+2.43.0
+

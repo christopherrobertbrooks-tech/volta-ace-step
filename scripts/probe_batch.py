@@ -25,9 +25,11 @@ def hook(name):
     group = "lyric" if ".lyric_encoder" in name else "decoder" if ".decoder" in name else "vae" if name.startswith("vae") else "other"
     def f(mod, inp, out):
         for t in tensors(out):
-            if t.is_floating_point() and t.numel():
+            # Skip 4-D tensors: eager attention also returns its weights (batch x heads x L x L, softmax <= 1), and
+            # a[isfinite(a)] on those copied ~15 GB for a 4-minute CFG song and ran the V100 out of memory.
+            if t.is_floating_point() and t.numel() and t.dim() != 4:
                 a = t.detach(); fin = torch.isfinite(a)
-                v = a[fin].abs().max().item() if bool(fin.any()) else 0.0
+                v = torch.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).abs().max().item()
                 if v > cur.get(group, (0, ""))[0]: cur[group] = (v, name)
                 if not bool(fin.all()) and "first_bad" not in cur: cur["first_bad"] = name
     return f
@@ -41,7 +43,7 @@ for i in ids:
     cur.clear()
     p = GenerationParams(task_type="text2music", thinking=False, caption=ex.get("caption", ""), lyrics=ex.get("lyrics", ""),
         bpm=ex.get("bpm"), keyscale=ex.get("keyscale", ""), timesignature=ex.get("timesignature", ""),
-        vocal_language=ex.get("language", "en"), duration=ex.get("duration"), inference_steps=8, guidance_scale=1.0, seed=1234)
+        vocal_language=ex.get("language", "en"), duration=ex.get("duration"), inference_steps=int(os.environ.get("ACE_STEPS", 8)), seed=1234, **({"guidance_scale": float(os.environ["ACE_CFG"])} if os.environ.get("ACE_CFG") else {}))
     t0 = time.time()
     r = generate_music(dit, LLMHandler(), params=p, config=GenerationConfig(batch_size=1, audio_format="wav"), save_dir=f"/mnt/steam/ace-step/work/out-{tag}-{i}")
     el = time.time() - t0
