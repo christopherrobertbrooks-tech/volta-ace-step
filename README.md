@@ -94,10 +94,13 @@ checkpoints carry their own copy of the modeling code. We'll offer both and foll
 
 ## Other findings
 
-- **The 5 Hz LM (planner) works on the V100 with both backends.** The default `vllm` backend (bundled nano-vllm)
-  detects Volta, switches itself to FP16 and runs eager: 1.7B LM + turbo, a 3:48 song in 38 s, of which the LM is
-  31 s. The `pt` backend: 3/3 songs, LM 110-126 s each. (An earlier version of this page said nano-vllm doesn't
-  support sm_70; it does.)
+- **The 5 Hz LM (planner): the `pt` backend works on the V100; the default `vllm` backend does not.** Bundled
+  nano-vllm detects Volta, switches itself to FP16 and runs eager -- but its output is garbage: the "Debug output
+  text" is `!!!!!!!!...` (the classic sign of non-finite logits), for the song plan and for the audio codes alike.
+  The `pt` backend writes real plans and real audio codes (3/3 songs; LM 110-126 s for a 3:48 song). *Correction
+  (2026-10-08): an earlier version of this page said nano-vllm works on sm_70 because the songs came out; they did
+  only because the caption and lyrics were supplied, so the planner's garbage wasn't needed.* Likely another FP16
+  overflow, in the LM this time -- next thing to look at.
 - **The audio decoder (VAE) is fine in FP16:** no NaN, no silence, RMS 0.150 vs 0.147 forced-FP32 on the same song.
   The "silent output" reports are most likely the NaN latents above, decoded.
 - **`ACESTEP_DTYPE` does nothing upstream:** it appears once in the code -- inside the error message telling you to
